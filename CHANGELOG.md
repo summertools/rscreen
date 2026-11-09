@@ -4,6 +4,20 @@ All notable changes to rscreen are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and rscreen uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.3] - 2026-11-09
+
+### Fixed
+
+- Hardened CI and release test timing so heavily loaded GitHub runners cannot
+  fail the 1–3 second handshake and e2e waits used by the test harness.
+- Release validation now fails early when the pushed tag does not match
+  `Cargo.toml`, verifies every archive checksum before publishing, and emits
+  annotated error lines plus a downloadable test log when a matrix test fails.
+- This release includes the terminal `EAGAIN` client fix documented under
+  0.1.2; the 0.1.2 tag never produced a published GitHub Release.
+
+[0.1.3]: https://github.com/summertools/rscreen/releases/tag/v0.1.3
+
 ## [0.1.2] - 2026-11-09
 
 ### Fixed

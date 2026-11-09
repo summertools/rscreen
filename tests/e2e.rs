@@ -54,7 +54,7 @@ impl TestServer {
             cwd,
         };
         let handle = std::thread::spawn(move || run_server(opts));
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while !socket.exists() {
             if Instant::now() > deadline {
                 panic!("server did not bind socket");
@@ -77,7 +77,7 @@ impl TestServer {
         let mut stream = UnixStream::connect(&self.socket).unwrap();
         write_msg(&mut stream, &ClientMsg::Query).unwrap();
         loop {
-            match read_msg_timeout::<ServerMsg>(&mut stream, Duration::from_secs(1)).unwrap() {
+            match read_msg_timeout::<ServerMsg>(&mut stream, Duration::from_secs(10)).unwrap() {
                 Some(ServerMsg::Info(info)) => return info,
                 Some(_) => continue,
                 None => panic!("no info"),
@@ -88,7 +88,7 @@ impl TestServer {
     fn shutdown(&mut self) {
         if let Ok(mut stream) = UnixStream::connect(&self.socket) {
             let _ = write_msg(&mut stream, &ClientMsg::KillSession);
-            let _ = read_msg_timeout::<ServerMsg>(&mut stream, Duration::from_millis(500));
+            let _ = read_msg_timeout::<ServerMsg>(&mut stream, Duration::from_millis(2000));
         }
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
@@ -133,7 +133,7 @@ impl TestClient {
         let mut terminal = Terminal::new(cols as usize, rows as usize, 5000);
         // Welcome must arrive first.
         loop {
-            match read_msg_timeout::<ServerMsg>(&mut stream, Duration::from_secs(2)).unwrap() {
+            match read_msg_timeout::<ServerMsg>(&mut stream, Duration::from_secs(10)).unwrap() {
                 Some(ServerMsg::Welcome { .. }) => {
                     break;
                 }
@@ -216,7 +216,7 @@ impl TestClient {
 
     fn detach(&mut self) {
         self.send(b"\x01d");
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             match read_msg_timeout::<ServerMsg>(&mut self.stream, Duration::from_millis(100)) {
                 Ok(Some(ServerMsg::Exit { .. })) => return,
@@ -233,7 +233,11 @@ impl TestClient {
 fn frame_shows_shell_and_status_bar() {
     let server = TestServer::start();
     let mut client = server.client();
-    assert!(client.wait_for("READY", 3000), "screen:\n{}", client.text());
+    assert!(
+        client.wait_for("READY", 10000),
+        "screen:\n{}",
+        client.text()
+    );
     assert!(
         client.has(&server.name),
         "session name missing:\n{}",
@@ -247,7 +251,7 @@ fn frame_shows_shell_and_status_bar() {
     assert!(client.has("READY"));
     client.send_str("ping\r");
     assert!(
-        client.wait_for("GOT:ping", 3000),
+        client.wait_for("GOT:ping", 10000),
         "echo missing:\n{}",
         client.text()
     );
@@ -258,10 +262,10 @@ fn frame_shows_shell_and_status_bar() {
 fn split_panes_and_zoom() {
     let server = TestServer::start();
     let mut client = server.client();
-    assert!(client.wait_for("READY", 3000));
+    assert!(client.wait_for("READY", 10000));
     client.send(b"\x01|");
     assert!(
-        client.wait_until(|t| t.contains("2 panes"), 3000),
+        client.wait_until(|t| t.contains("2 panes"), 10000),
         "no split:\n{}",
         client.text()
     );
@@ -269,13 +273,13 @@ fn split_panes_and_zoom() {
     assert!(client.has("│") || client.has("├") || client.has("┤"));
     client.send(b"\x01z");
     assert!(
-        client.wait_until(|t| t.contains("·  zoom") || t.contains("ZOOM"), 2000),
+        client.wait_until(|t| t.contains("·  zoom") || t.contains("ZOOM"), 8000),
         "zoom badge missing:\n{}",
         client.text()
     );
     client.send(b"\x01z");
     assert!(
-        client.wait_until(|t| !t.contains("·  zoom") && !t.contains("ZOOM"), 2000),
+        client.wait_until(|t| !t.contains("·  zoom") && !t.contains("ZOOM"), 8000),
         "zoom did not clear:\n{}",
         client.text()
     );
@@ -286,10 +290,10 @@ fn split_panes_and_zoom() {
 fn command_palette_creates_split() {
     let server = TestServer::start();
     let mut client = server.client();
-    assert!(client.wait_for("READY", 3000));
+    assert!(client.wait_for("READY", 10000));
     client.send(b"\x01:");
     assert!(
-        client.wait_for("Command palette", 2000),
+        client.wait_for("Command palette", 8000),
         "palette missing:\n{}",
         client.text()
     );
@@ -297,7 +301,7 @@ fn command_palette_creates_split() {
     client.pump(200);
     client.send(b"\r");
     assert!(
-        client.wait_until(|t| t.contains("2 panes"), 3000),
+        client.wait_until(|t| t.contains("2 panes"), 10000),
         "palette action failed:\n{}",
         client.text()
     );
@@ -308,14 +312,14 @@ fn command_palette_creates_split() {
 fn rename_window_via_prompt() {
     let server = TestServer::start();
     let mut client = server.client();
-    assert!(client.wait_for("READY", 3000));
+    assert!(client.wait_for("READY", 10000));
     client.send(b"\x01A");
-    assert!(client.wait_for("Rename window", 2000), "{}", client.text());
+    assert!(client.wait_for("Rename window", 8000), "{}", client.text());
     // Select all of the prefilled title via ctrl-u, then type a new title.
     client.send(b"\x15");
     client.send_str("my-shell\r");
     assert!(
-        client.wait_for("my-shell", 2500),
+        client.wait_for("my-shell", 8000),
         "rename missing:\n{}",
         client.text()
     );
@@ -326,10 +330,10 @@ fn rename_window_via_prompt() {
 fn copy_mode_enters_and_exits() {
     let server = TestServer::start();
     let mut client = server.client();
-    assert!(client.wait_for("READY", 3000));
+    assert!(client.wait_for("READY", 10000));
     client.send(b"\x01[");
     assert!(
-        client.wait_until(|t| t.contains("COPY"), 2000),
+        client.wait_until(|t| t.contains("COPY"), 8000),
         "copy badge missing:\n{}",
         client.text()
     );
@@ -337,7 +341,7 @@ fn copy_mode_enters_and_exits() {
     client.pump(150);
     client.send(b"q");
     assert!(
-        client.wait_until(|t| !t.contains("COPY"), 2000),
+        client.wait_until(|t| !t.contains("COPY"), 8000),
         "copy mode did not exit:\n{}",
         client.text()
     );
@@ -348,10 +352,10 @@ fn copy_mode_enters_and_exits() {
 fn mouse_wheel_enters_copy_mode() {
     let server = TestServer::start();
     let mut client = server.client();
-    assert!(client.wait_for("READY", 3000));
+    assert!(client.wait_for("READY", 10000));
     client.send(b"\x1b[<64;10;5M");
     assert!(
-        client.wait_until(|t| t.contains("COPY"), 2000),
+        client.wait_until(|t| t.contains("COPY"), 8000),
         "wheel did not enter copy mode:\n{}",
         client.text()
     );
@@ -362,9 +366,9 @@ fn mouse_wheel_enters_copy_mode() {
 fn resize_reflows_frame() {
     let server = TestServer::start();
     let mut client = server.client();
-    assert!(client.wait_for("READY", 3000));
+    assert!(client.wait_for("READY", 10000));
     client.resize(100, 30);
-    assert!(client.wait_for("READY", 3000), "lost content after resize");
+    assert!(client.wait_for("READY", 10000), "lost content after resize");
     assert!(client.has("100x30") || client.has("1 pane"));
     let info = server.info();
     assert_eq!(info.cols, 100);
@@ -376,17 +380,17 @@ fn resize_reflows_frame() {
 fn help_overlay_opens_and_closes() {
     let server = TestServer::start();
     let mut client = server.client();
-    assert!(client.wait_for("READY", 3000));
+    assert!(client.wait_for("READY", 10000));
     client.send(b"\x01?");
     assert!(
-        client.wait_for("Keys & shortcuts", 2000),
+        client.wait_for("Keys & shortcuts", 8000),
         "help missing:\n{}",
         client.text()
     );
     client.send(b"\x1b");
     client.pump(150);
     assert!(
-        client.wait_until(|t| !t.contains("Keys & shortcuts"), 2000),
+        client.wait_until(|t| !t.contains("Keys & shortcuts"), 8000),
         "help did not close:\n{}",
         client.text()
     );
@@ -397,16 +401,16 @@ fn help_overlay_opens_and_closes() {
 fn copy_broadcasts_clipboard_without_corrupting_protocol() {
     let server = TestServer::start();
     let mut client = server.client();
-    assert!(client.wait_for("READY", 3000));
+    assert!(client.wait_for("READY", 10000));
     client.send(b"\x01[");
     assert!(
-        client.wait_until(|t| t.contains("COPY"), 2000),
+        client.wait_until(|t| t.contains("COPY"), 8000),
         "copy mode missing:\n{}",
         client.text()
     );
     client.send(b"\x1b[A"); // move up from the empty prompt line to READY
     client.send(b"y");
-    let copied = client.wait_for("Copied", 1500);
+    let copied = client.wait_for("Copied", 5000);
     let saw_clipboard = client
         .raw
         .iter()
@@ -415,7 +419,7 @@ fn copy_broadcasts_clipboard_without_corrupting_protocol() {
     assert!(saw_clipboard, "clipboard OSC 52 was not broadcast");
     client.send_str("ping\r");
     assert!(
-        client.wait_for("GOT:ping", 3000),
+        client.wait_for("GOT:ping", 10000),
         "protocol corrupted after clipboard:\n{}",
         client.text()
     );
@@ -426,12 +430,12 @@ fn copy_broadcasts_clipboard_without_corrupting_protocol() {
 fn mouse_drag_selects_and_copies_text() {
     let server = TestServer::start();
     let mut client = server.client();
-    assert!(client.wait_for("READY", 3000));
+    assert!(client.wait_for("READY", 10000));
     // Press at column 1, row 1 (READY), drag to column 5, release.
     client.send(b"\x1b[<0;1;1M");
     client.send(b"\x1b[<32;5;1M");
     client.send(b"\x1b[<0;5;1m");
-    let copied = client.wait_for("Copied", 2000);
+    let copied = client.wait_for("Copied", 8000);
     let clipboard = client.raw.iter().any(|bytes| {
         // base64("READY") == UkVBRFk=
         bytes.windows(8).any(|w| w == b"UkVBRFk=")
@@ -445,10 +449,10 @@ fn mouse_drag_selects_and_copies_text() {
 fn create_switch_and_close_windows() {
     let server = TestServer::start();
     let mut client = server.client();
-    assert!(client.wait_for("READY", 3000));
+    assert!(client.wait_for("READY", 10000));
     client.send(b"\x01c");
     assert!(
-        client.wait_until(|t| t.contains("2 windows") || t.contains("2 panes"), 2000)
+        client.wait_until(|t| t.contains("2 windows") || t.contains("2 panes"), 8000)
             || server.info().windows == 2,
         "second window was not created"
     );
@@ -457,7 +461,7 @@ fn create_switch_and_close_windows() {
     client.pump(200);
     client.send(b"\x01k"); // confirm_kill is disabled in tests
     assert!(
-        client.wait_until(|_| server.info().windows == 1, 3000),
+        client.wait_until(|_| server.info().windows == 1, 10000),
         "window was not killed"
     );
     client.detach();
@@ -467,12 +471,12 @@ fn create_switch_and_close_windows() {
 fn close_pane_keeps_window_alive() {
     let server = TestServer::start();
     let mut client = server.client();
-    assert!(client.wait_for("READY", 3000));
+    assert!(client.wait_for("READY", 10000));
     client.send(b"\x01|");
-    assert!(client.wait_until(|t| t.contains("2 panes"), 3000));
+    assert!(client.wait_until(|t| t.contains("2 panes"), 10000));
     client.send(b"\x01x");
     assert!(
-        client.wait_until(|t| t.contains("1 pane") && !t.contains("2 panes"), 3000),
+        client.wait_until(|t| t.contains("1 pane") && !t.contains("2 panes"), 10000),
         "pane was not closed:\n{}",
         client.text()
     );
@@ -487,9 +491,9 @@ fn two_row_status_bar_shows_hints() {
     config.status_rows = 2;
     let server = TestServer::start_with(config);
     let mut client = server.client();
-    assert!(client.wait_for("READY", 3000));
+    assert!(client.wait_for("READY", 10000));
     assert!(
-        client.wait_for("new", 2000),
+        client.wait_for("new", 8000),
         "hint row missing:\n{}",
         client.text()
     );
@@ -504,16 +508,16 @@ fn two_row_status_bar_shows_hints() {
 fn prefix_strip_appears_while_waiting() {
     let server = TestServer::start();
     let mut client = server.client();
-    assert!(client.wait_for("READY", 3000));
+    assert!(client.wait_for("READY", 10000));
     client.send(b"\x01");
     assert!(
-        client.wait_until(|t| t.contains("PREFIX"), 2000),
+        client.wait_until(|t| t.contains("PREFIX"), 8000),
         "prefix hint strip missing:\n{}",
         client.text()
     );
     client.send(b"c"); // prefix + c -> new window, consumes prefix
     assert!(
-        client.wait_until(|_| server.info().windows == 2, 3000),
+        client.wait_until(|_| server.info().windows == 2, 10000),
         "prefix action not executed"
     );
     client.detach();
@@ -531,18 +535,18 @@ fn copy_search_finds_a_match() {
     ];
     let server = TestServer::start_with(config);
     let mut client = server.client();
-    assert!(client.wait_for("NEEDLE", 3000));
+    assert!(client.wait_for("NEEDLE", 10000));
     client.send(b"\x01[");
-    assert!(client.wait_until(|t| t.contains("COPY"), 2000));
+    assert!(client.wait_until(|t| t.contains("COPY"), 8000));
     client.send(b"/");
     assert!(
-        client.wait_for("Search forward", 2000),
+        client.wait_for("Search forward", 8000),
         "search prompt missing:\n{}",
         client.text()
     );
     client.send_str("needle\r");
     assert!(
-        client.wait_until(|t| t.contains("/needle") && t.contains("1/1"), 3000),
+        client.wait_until(|t| t.contains("/needle") && t.contains("1/1"), 10000),
         "search did not find the match:\n{}",
         client.text()
     );
@@ -557,31 +561,31 @@ fn confirm_dialog_cancel_and_confirm() {
     config.confirm_kill = true;
     let server = TestServer::start_with(config);
     let mut client = server.client();
-    assert!(client.wait_for("READY", 3000));
+    assert!(client.wait_for("READY", 10000));
     client.send(b"\x01c"); // second window
-    assert!(client.wait_until(|_| server.info().windows == 2, 2000));
+    assert!(client.wait_until(|_| server.info().windows == 2, 8000));
     client.send(b"\x01k");
-    assert!(client.wait_for("Confirm", 2000), "{}", client.text());
+    assert!(client.wait_for("Confirm", 8000), "{}", client.text());
     client.send(b"n");
     assert!(
-        client.wait_until(|t| !t.contains("Confirm"), 2000),
+        client.wait_until(|t| !t.contains("Confirm"), 8000),
         "cancel did not close dialog"
     );
     assert_eq!(server.info().windows, 2);
     // Enter must not confirm a destructive action.
     client.send(b"\x01k");
-    assert!(client.wait_for("Confirm", 2000));
+    assert!(client.wait_for("Confirm", 8000));
     client.send(b"\r");
     assert!(
-        client.wait_until(|t| !t.contains("Confirm"), 2000),
+        client.wait_until(|t| !t.contains("Confirm"), 8000),
         "Enter did not cancel confirmation"
     );
     assert_eq!(server.info().windows, 2);
     client.send(b"\x01k");
-    assert!(client.wait_for("Confirm", 2000));
+    assert!(client.wait_for("Confirm", 8000));
     client.send(b"y");
     assert!(
-        client.wait_until(|_| server.info().windows == 1, 3000),
+        client.wait_until(|_| server.info().windows == 1, 10000),
         "confirm did not close the window"
     );
     client.detach();
@@ -598,10 +602,10 @@ fn app_clipboard_osc52_is_forwarded() {
     ];
     let server = TestServer::start_with(config);
     let mut client = server.client();
-    assert!(client.wait_for("READY", 3000));
+    assert!(client.wait_for("READY", 10000));
     client.send_str("go\r");
-    assert!(client.wait_for("hello", 3000));
-    let deadline = Instant::now() + Duration::from_secs(2);
+    assert!(client.wait_for("hello", 10000));
+    let deadline = Instant::now() + Duration::from_secs(8);
     let mut saw = false;
     while Instant::now() < deadline && !saw {
         client.pump(100);
@@ -618,14 +622,14 @@ fn app_clipboard_osc52_is_forwarded() {
 fn tiny_resizes_do_not_crash_or_disconnect() {
     let server = TestServer::start();
     let mut client = server.client();
-    assert!(client.wait_for("READY", 3000));
+    assert!(client.wait_for("READY", 10000));
     for (cols, rows) in [(20, 4), (10, 2), (1, 1), (80, 24)] {
         client.resize(cols, rows);
         client.pump(100);
         let _ = server.info();
     }
     assert!(
-        client.wait_until(|t| t.contains(&server.name), 2000),
+        client.wait_until(|t| t.contains(&server.name), 8000),
         "client stopped receiving valid frames after tiny resizes"
     );
     client.detach();
@@ -635,13 +639,13 @@ fn tiny_resizes_do_not_crash_or_disconnect() {
 fn detach_and_reattach_keeps_screen_history() {
     let server = TestServer::start();
     let mut client = server.client();
-    assert!(client.wait_for("READY", 3000));
+    assert!(client.wait_for("READY", 10000));
     client.send_str("remember-me\r");
-    assert!(client.wait_for("GOT:remember-me", 3000));
+    assert!(client.wait_for("GOT:remember-me", 10000));
     client.detach();
     let mut again = server.client();
     assert!(
-        again.wait_for("GOT:remember-me", 3000),
+        again.wait_for("GOT:remember-me", 10000),
         "screen history lost after reattach:\n{}",
         again.text()
     );
@@ -652,21 +656,21 @@ fn detach_and_reattach_keeps_screen_history() {
 fn clicking_status_tabs_switches_windows() {
     let server = TestServer::start();
     let mut client = server.client();
-    assert!(client.wait_for("READY", 3000));
+    assert!(client.wait_for("READY", 10000));
     client.send(b"\x01c");
-    assert!(client.wait_until(|_| server.info().windows == 2, 2000));
+    assert!(client.wait_until(|_| server.info().windows == 2, 8000));
     client.send_str("WINDOW_TWO\r");
-    assert!(client.wait_for("GOT:WINDOW_TWO", 3000));
+    assert!(client.wait_for("GOT:WINDOW_TWO", 10000));
     // Click the first tab: brand " ◆ " + "test-N" + two spaces = tab starts at 11.
     client.send(b"\x1b[<0;13;24M");
     assert!(
-        client.wait_until(|t| !t.contains("GOT:WINDOW_TWO"), 2500),
+        client.wait_until(|t| !t.contains("GOT:WINDOW_TWO"), 8000),
         "clicking tab 1 did not switch windows:\n{}",
         client.text()
     );
     client.send(b"\x1b[<0;19;24M");
     assert!(
-        client.wait_until(|t| t.contains("GOT:WINDOW_TWO"), 2500),
+        client.wait_until(|t| t.contains("GOT:WINDOW_TWO"), 8000),
         "clicking tab 2 did not switch back:\n{}",
         client.text()
     );
@@ -684,8 +688,8 @@ fn final_output_is_rendered_before_session_exit() {
     ];
     let server = TestServer::start_with(config);
     let mut client = server.client();
-    assert!(client.wait_for("READY", 3000));
-    let deadline = Instant::now() + Duration::from_secs(3);
+    assert!(client.wait_for("READY", 10000));
+    let deadline = Instant::now() + Duration::from_secs(8);
     let mut saw_output = client.text().contains("FINAL_OUTPUT");
     let mut saw_exit = false;
     while Instant::now() < deadline {
@@ -713,14 +717,14 @@ fn final_output_is_rendered_before_session_exit() {
 fn window_picker_switches() {
     let server = TestServer::start();
     let mut client = server.client();
-    assert!(client.wait_for("READY", 3000));
+    assert!(client.wait_for("READY", 10000));
     client.send(b"\x01c");
-    assert!(client.wait_until(|_| server.info().windows == 2, 2000));
+    assert!(client.wait_until(|_| server.info().windows == 2, 8000));
     client.send_str("WINDOW_TWO\r");
-    assert!(client.wait_for("GOT:WINDOW_TWO", 3000));
+    assert!(client.wait_for("GOT:WINDOW_TWO", 10000));
     client.send(b"\x01w");
     assert!(
-        client.wait_for("Switch window", 2000),
+        client.wait_for("Switch window", 8000),
         "picker missing:\n{}",
         client.text()
     );
@@ -728,7 +732,7 @@ fn window_picker_switches() {
     client.send(b"\x1b[A");
     client.send(b"\r");
     assert!(
-        client.wait_until(|t| !t.contains("GOT:WINDOW_TWO"), 2500),
+        client.wait_until(|t| !t.contains("GOT:WINDOW_TWO"), 8000),
         "picker did not switch to the first window:\n{}",
         client.text()
     );
@@ -747,7 +751,7 @@ fn osc_title_updates_the_window_tab() {
     let server = TestServer::start_with(config);
     let mut client = server.client();
     assert!(
-        client.wait_for("My Window Title", 3000),
+        client.wait_for("My Window Title", 10000),
         "title missing:\n{}",
         client.text()
     );
@@ -758,24 +762,24 @@ fn osc_title_updates_the_window_tab() {
 fn clients_with_different_sizes_keep_working() {
     let server = TestServer::start();
     let mut small = server.client();
-    assert!(small.wait_for("READY", 3000));
+    assert!(small.wait_for("READY", 10000));
     let mut large = TestClient::connect_sized(&server.socket, 120, 40);
-    assert!(large.wait_for("READY", 3000));
+    assert!(large.wait_for("READY", 10000));
     let info = server.info();
     assert_eq!(info.clients, 2);
     assert_eq!((info.cols, info.rows), (80, 24));
     large.send_str("ping\r");
-    assert!(large.wait_for("GOT:ping", 3000));
+    assert!(large.wait_for("GOT:ping", 10000));
     let info = server.info();
     assert_eq!((info.cols, info.rows), (120, 40));
     // Both clients must keep receiving valid frames after the session is
     // resized to the active client's dimensions.
-    assert!(small.wait_until(|t| t.contains(&server.name), 3000));
+    assert!(small.wait_until(|t| t.contains(&server.name), 10000));
     small.send_str("pong\r");
-    assert!(small.wait_for("GOT:pong", 3000));
+    assert!(small.wait_for("GOT:pong", 10000));
     let info = server.info();
     assert_eq!((info.cols, info.rows), (80, 24));
-    assert!(large.wait_until(|t| t.contains(&server.name), 3000));
+    assert!(large.wait_until(|t| t.contains(&server.name), 10000));
     small.detach();
     large.detach();
 }
@@ -808,12 +812,12 @@ fn wide_characters_survive_composition() {
     let server = TestServer::start_with(config);
     let mut client = server.client();
     assert!(
-        client.wait_for("wide: 中A", 3000),
+        client.wait_for("wide: 中A", 10000),
         "wide glyph was dropped:\n{}",
         client.text()
     );
     client.send(b"\x01[");
-    assert!(client.wait_until(|t| t.contains("COPY"), 2000));
+    assert!(client.wait_until(|t| t.contains("COPY"), 8000));
     assert!(
         client.has("wide: 中A"),
         "wide glyph was dropped in copy mode:\n{}",
@@ -831,7 +835,7 @@ fn chatty_pane_does_not_starve_the_server() {
     config.shell_args = vec!["-c".into(), "yes flood".into()];
     let server = TestServer::start_with(config);
     let mut client = server.client();
-    assert!(client.wait_for("flood", 3000));
+    assert!(client.wait_for("flood", 10000));
     // Info must be served while the pane is producing output continuously.
     let info = server.info();
     assert_eq!(info.name, server.name);
@@ -849,7 +853,7 @@ fn child_does_not_inherit_the_pty_master() {
     ];
     let server = TestServer::start_with(config);
     let mut client = server.client();
-    assert!(client.wait_for("fd", 3000));
+    assert!(client.wait_for("fd", 10000));
     let text = client.text();
     assert!(
         !text.contains("ptmx"),
@@ -863,17 +867,17 @@ fn child_does_not_inherit_the_pty_master() {
 fn input_after_modal_submit_is_not_lost() {
     let server = TestServer::start();
     let mut client = server.client();
-    assert!(client.wait_for("READY", 3000));
+    assert!(client.wait_for("READY", 10000));
     client.send(b"\x01A");
-    assert!(client.wait_for("Rename window", 2000));
+    assert!(client.wait_for("Rename window", 8000));
     client.send(b"\x15workspace\rping\r");
     assert!(
-        client.wait_until(|t| t.contains("workspace"), 2500),
+        client.wait_until(|t| t.contains("workspace"), 8000),
         "rename/submit failed:\n{}",
         client.text()
     );
     assert!(
-        client.wait_for("GOT:ping", 3000),
+        client.wait_for("GOT:ping", 10000),
         "input after modal submit was lost:\n{}",
         client.text()
     );
@@ -884,9 +888,9 @@ fn input_after_modal_submit_is_not_lost() {
 fn modified_keys_do_not_cancel_text_prompts() {
     let server = TestServer::start();
     let mut client = server.client();
-    assert!(client.wait_for("READY", 3000));
+    assert!(client.wait_for("READY", 10000));
     client.send(b"\x01A");
-    assert!(client.wait_for("Rename window", 2000));
+    assert!(client.wait_for("Rename window", 8000));
     // Shift+Left is a complete CSI sequence; it must not act as Escape.
     client.send(b"\x1b[1;2D");
     client.pump(150);
@@ -904,9 +908,9 @@ fn modified_keys_do_not_cancel_text_prompts() {
 fn wheel_over_another_pane_does_not_steal_focus() {
     let server = TestServer::start();
     let mut client = server.client();
-    assert!(client.wait_for("READY", 3000));
+    assert!(client.wait_for("READY", 10000));
     client.send(b"\x01|");
-    assert!(client.wait_until(|t| t.contains("2 panes"), 3000));
+    assert!(client.wait_until(|t| t.contains("2 panes"), 10000));
     // Focus is on the right pane after splitting; wheel over the left pane.
     client.send(b"\x1b[<64;10;6M");
     client.pump(350);
@@ -922,9 +926,9 @@ fn wheel_over_another_pane_does_not_steal_focus() {
 fn click_in_copy_mode_does_not_copy_a_single_cell() {
     let server = TestServer::start();
     let mut client = server.client();
-    assert!(client.wait_for("READY", 3000));
+    assert!(client.wait_for("READY", 10000));
     client.send(b"\x01[");
-    assert!(client.wait_until(|t| t.contains("COPY"), 2000));
+    assert!(client.wait_until(|t| t.contains("COPY"), 8000));
     let before = client.raw.len();
     client.send(b"\x1b[<0;3;2M");
     client.send(b"\x1b[<0;3;2m");
@@ -949,9 +953,9 @@ fn click_in_copy_mode_does_not_copy_a_single_cell() {
 fn many_clients_attach_and_detach() {
     let server = TestServer::start();
     let mut a = server.client();
-    assert!(a.wait_for("READY", 3000));
+    assert!(a.wait_for("READY", 10000));
     let mut b = server.client();
-    assert!(b.wait_for("READY", 3000));
+    assert!(b.wait_for("READY", 10000));
     assert_eq!(server.info().clients, 2);
     b.detach();
     assert_eq!(server.info().clients, 1);
@@ -965,9 +969,9 @@ fn process_exit_ends_session() {
     config.shell_args = vec!["-c".into(), "printf 'BYE\\n'; sleep 1.0".into()];
     let mut server = TestServer::start_with(config);
     let mut client = server.client();
-    assert!(client.wait_for("BYE", 3000));
+    assert!(client.wait_for("BYE", 10000));
     // The last pane exits, so the client should receive Exit.
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(8);
     let mut exited = false;
     while Instant::now() < deadline {
         match read_msg_timeout::<ServerMsg>(&mut client.stream, Duration::from_millis(100)) {

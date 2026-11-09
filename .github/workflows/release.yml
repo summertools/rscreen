@@ -11,11 +11,33 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
 jobs:
+  validate:
+    name: validate tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check tag matches Cargo.toml
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          test -n "$version"
+          test "v${version}" = "${GITHUB_REF_NAME}"
+          echo "Releasing rscreen v${version}"
+
   build:
     name: build ${{ matrix.target }}
+    needs: validate
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -34,7 +56,27 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Test
-        run: cargo test --locked --target ${{ matrix.target }} -- --test-threads=1
+        shell: bash
+        run: |
+          set +e
+          cargo test --locked --target ${{ matrix.target }} -- --test-threads=1 2>&1 \
+            | tee "test-${{ matrix.target }}.log"
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            grep -E '^test .*FAILED|panicked at|assertion .*failed|error: test failed' \
+              "test-${{ matrix.target }}.log" \
+              | head -20 \
+              | while IFS= read -r line; do echo "::error title=Test failure::$line"; done
+          fi
+          exit "$status"
+      - name: Upload failing test log
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-log-${{ matrix.target }}
+          path: test-${{ matrix.target }}.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Build release binary
         run: cargo build --locked --release --target ${{ matrix.target }}
@@ -71,6 +113,19 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+
+      - name: Verify checksums
+        working-directory: artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(*.sha256)
+          test "${#files[@]}" -gt 0
+          for file in "${files[@]}"; do
+            sha256sum --check "$file"
+          done
+          cat "${files[@]}" > SHA256SUMS
 
       - name: Show artifacts
         run: ls -lh artifacts

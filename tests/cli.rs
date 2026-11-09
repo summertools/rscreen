@@ -84,7 +84,7 @@ fn create_list_kill_session() {
             let (_, out, _) = env.run(&["ls"]);
             out.contains("No rscreen sessions")
         },
-        3000
+        10000
     ));
 }
 

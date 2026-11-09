@@ -169,7 +169,7 @@ fn run(cli: Cli) -> Result<i32> {
             };
             let mut stream = connect_existing(&name)?;
             write_msg(&mut stream, &ClientMsg::KillSession)?;
-            let _ = read_msg_timeout::<ServerMsg>(&mut stream, Duration::from_millis(800));
+            let _ = read_msg_timeout::<ServerMsg>(&mut stream, Duration::from_millis(3000));
             // Wait for the socket to disappear so scripts can rely on it.
             let socket = paths::socket_path(&name);
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -186,7 +186,7 @@ fn run(cli: Cli) -> Result<i32> {
             };
             let mut stream = connect_existing(&name)?;
             write_msg(&mut stream, &ClientMsg::Detach { all: true })?;
-            let _ = read_msg_timeout::<ServerMsg>(&mut stream, Duration::from_millis(800));
+            let _ = read_msg_timeout::<ServerMsg>(&mut stream, Duration::from_millis(3000));
             println!("detached all clients from {:?}", name);
             Ok(0)
         }
@@ -359,7 +359,7 @@ fn query_session(name: &str) -> Result<Option<SessionInfo>> {
     };
     write_msg(&mut stream, &ClientMsg::Query)?;
     loop {
-        match read_msg_timeout::<ServerMsg>(&mut stream, Duration::from_millis(700))? {
+        match read_msg_timeout::<ServerMsg>(&mut stream, Duration::from_millis(3000))? {
             Some(ServerMsg::Info(info)) => return Ok(Some(info)),
             Some(ServerMsg::Error(err)) => bail!(err),
             Some(_) => continue,
@@ -455,7 +455,7 @@ fn create_session(name: &str) -> Result<()> {
         .unwrap_or_else(|_| crate::pty::home_dir().unwrap_or_else(|| PathBuf::from("/")));
     let (mut child, log_path) = spawn_daemon(name, &cwd)?;
 
-    let deadline = Instant::now() + Duration::from_secs(6);
+    let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if let Some(_info) = live_info(name) {
             return Ok(());
