@@ -5,6 +5,8 @@ use unicode_width::UnicodeWidthChar;
 
 use super::style::Style;
 
+const MAX_COMBINING_BYTES: usize = 128;
+
 /// One cell in the terminal grid.
 ///
 /// Wide glyphs occupy two cells: the leading cell has `wide == true`, the
@@ -67,6 +69,16 @@ impl Cell {
     }
 
     pub fn append_combining(&mut self, c: char) {
+        if self
+            .extra
+            .as_ref()
+            .map(|s| s.len())
+            .unwrap_or(0)
+            .saturating_add(c.len_utf8())
+            > MAX_COMBINING_BYTES
+        {
+            return;
+        }
         match &mut self.extra {
             Some(s) => {
                 let mut new = String::with_capacity(s.len() + c.len_utf8());
@@ -142,5 +154,9 @@ mod tests {
         c.append_combining('\u{0301}');
         assert_eq!(c.text(), "e\u{0301}");
         assert_eq!(c.display_width(), 1);
+        for _ in 0..1000 {
+            c.append_combining('\u{0301}');
+        }
+        assert!(c.extra.as_ref().unwrap().len() <= MAX_COMBINING_BYTES);
     }
 }

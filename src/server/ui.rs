@@ -30,6 +30,7 @@ pub enum PaletteAction {
     PasteBuffer,
     Help,
     Detach,
+    DetachAll,
     KillSession,
     ToggleStatusRows,
     SendPrefix,
@@ -53,6 +54,27 @@ pub enum PaletteCategory {
 pub enum PaletteKind {
     All,
     Windows,
+}
+
+pub const MAX_INPUT_CHARS: usize = 4096;
+
+/// Return a horizontally scrolled view of `line` that keeps the cursor inside
+/// `max` display columns, plus the cursor's display offset.
+fn input_window(line: &InputLine, max: usize) -> (String, usize) {
+    let max = max.max(1);
+    let chars = &line.chars;
+    let mut start = 0;
+    let mut cursor_width: usize = chars[..line.cursor.min(chars.len())]
+        .iter()
+        .map(|c| text_width(&c.to_string()))
+        .sum();
+    while start < line.cursor && cursor_width >= max {
+        cursor_width = cursor_width.saturating_sub(text_width(&chars[start].to_string()));
+        start += 1;
+    }
+    let tail: String = chars[start..].iter().collect();
+    let shown = truncate_display(&tail, max);
+    (shown, cursor_width.min(max.saturating_sub(1)))
 }
 
 #[derive(Clone, Debug)]
@@ -82,12 +104,16 @@ impl InputLine {
     }
 
     pub fn insert(&mut self, c: char) {
+        if self.chars.len() >= MAX_INPUT_CHARS {
+            return;
+        }
         self.chars.insert(self.cursor, c);
         self.cursor += 1;
     }
 
     pub fn insert_str(&mut self, s: &str) {
-        for c in s.chars() {
+        let room = MAX_INPUT_CHARS.saturating_sub(self.chars.len());
+        for c in s.chars().take(room) {
             self.insert(c);
         }
     }
@@ -395,7 +421,7 @@ fn draw_palette(
         .bg(theme.overlay_bg)
         .bold();
     let inner = draw_panel(canvas, theme, rect, Some(title), title_style);
-    if inner.w < 8 || inner.h < 4 {
+    if inner.w < 8 || inner.h < 2 {
         return;
     }
     let muted = Style::default().fg(theme.muted).bg(theme.overlay_bg);
@@ -410,9 +436,6 @@ fn draw_palette(
     let query = palette.query.text();
     let query_x = inner.x + 2;
     let query_max = inner.w.saturating_sub(2);
-    let shown = truncate_display(&query, query_max as usize);
-    canvas.put_str(query_x, qy, query_max, &shown, text);
-    let before: String = palette.query.chars[..palette.query.cursor].iter().collect();
     let cursor_x = if query.is_empty() {
         canvas.put_str(
             query_x + 1,
@@ -423,8 +446,11 @@ fn draw_palette(
         );
         query_x
     } else {
-        (query_x + text_width(&before) as u16).min(query_x + query_max.saturating_sub(1))
+        let (shown, offset) = input_window(&palette.query, query_max as usize);
+        canvas.put_str(query_x, qy, query_max, &shown, text);
+        query_x + offset as u16
     };
+    let cursor_x = cursor_x.min(query_x + query_max.saturating_sub(1));
     if cursor_x < inner.x + inner.w {
         canvas.set_cursor(Some(crate::render::CursorView {
             x: cursor_x,
@@ -434,20 +460,25 @@ fn draw_palette(
         }));
     }
 
+    let footer_y = inner.y + inner.h - 1;
+    let footer = match palette.kind {
+        PaletteKind::All => "↑↓ move   ↵ run   esc close",
+        PaletteKind::Windows => "↑↓ move   ↵ switch   esc close",
+    };
+    if inner.h < 4 {
+        if footer_y > qy {
+            canvas.put_str(inner.x, footer_y, inner.w, footer, muted);
+        }
+        return;
+    }
+
     // Divider.
     let divider_y = qy + 1;
     for x in inner.x..inner.x + inner.w {
         canvas.set(x, divider_y, crate::term::Cell::ch('─', muted));
     }
 
-    // Footer.
-    let footer_y = inner.y + inner.h - 1;
-    let footer = match palette.kind {
-        PaletteKind::All => "↑↓ move   ↵ run   esc close",
-        PaletteKind::Windows => "↑↓ move   ↵ switch   esc close",
-    };
     canvas.put_str(inner.x, footer_y, inner.w, footer, muted);
-
     let list_top = divider_y + 1;
     let list_h = footer_y.saturating_sub(list_top) as usize;
     let total = palette.filtered().len();
@@ -509,13 +540,19 @@ fn draw_palette(
     if list_h > 0 && total > list_h {
         let pos = format!("{}–{}/{}", scroll + 1, (scroll + list_h).min(total), total);
         let w = text_width(&pos) as u16;
-        canvas.put_str(
-            inner.x + inner.w.saturating_sub(w),
-            footer_y,
-            w,
-            &pos,
-            muted,
-        );
+        if (text_width(footer) as u16)
+            .saturating_add(w)
+            .saturating_add(1)
+            <= inner.w
+        {
+            canvas.put_str(
+                inner.x + inner.w.saturating_sub(w),
+                footer_y,
+                w,
+                &pos,
+                muted,
+            );
+        }
     }
 }
 
@@ -528,7 +565,7 @@ fn draw_help(canvas: &mut Canvas, theme: &crate::config::Theme, help: &HelpState
         .bg(theme.overlay_bg)
         .bold();
     let inner = draw_panel(canvas, theme, rect, Some("Keys & shortcuts"), title_style);
-    if inner.w < 10 || inner.h < 4 {
+    if inner.w < 6 || inner.h < 1 {
         return;
     }
     let muted = Style::default().fg(theme.muted).bg(theme.overlay_bg);
@@ -560,7 +597,9 @@ fn draw_help(canvas: &mut Canvas, theme: &crate::config::Theme, help: &HelpState
     help.viewport.set(list_h.max(1));
     let max_scroll = lines.len().saturating_sub(list_h);
     let scroll = help.scroll.min(max_scroll);
-    let key_width: u16 = 18;
+    let key_width: u16 = 18.min(inner.w.saturating_sub(8)).max(2);
+    let desc_x = inner.x + 2 + key_width;
+    let desc_w = inner.w.saturating_sub(2 + key_width);
     for (i, line) in lines.iter().skip(scroll).take(list_h).enumerate() {
         let y = inner.y + i as u16;
         match line {
@@ -576,22 +615,17 @@ fn draw_help(canvas: &mut Canvas, theme: &crate::config::Theme, help: &HelpState
                 );
                 canvas.put_str(inner.x + 1, y, key_width, &key, key_style);
                 canvas.put_str(
-                    inner.x + 2 + key_width,
+                    desc_x,
                     y,
-                    inner.w.saturating_sub(2 + key_width),
-                    &truncate_display(desc, inner.w.saturating_sub(2 + key_width) as usize),
+                    desc_w,
+                    &truncate_display(desc, desc_w as usize),
                     desc_style,
                 );
             }
         }
     }
-    canvas.put_str(
-        inner.x,
-        footer_y,
-        inner.w / 2,
-        "↑↓ scroll   q / esc close",
-        muted,
-    );
+    let footer = "↑↓ scroll   q / esc close";
+    canvas.put_str(inner.x, footer_y, inner.w, footer, muted);
     if max_scroll > 0 {
         let pos = format!(
             "{}–{}/{}",
@@ -600,13 +634,19 @@ fn draw_help(canvas: &mut Canvas, theme: &crate::config::Theme, help: &HelpState
             lines.len()
         );
         let w = text_width(&pos) as u16;
-        canvas.put_str(
-            inner.x + inner.w.saturating_sub(w),
-            footer_y,
-            w,
-            &pos,
-            muted,
-        );
+        if (text_width(footer) as u16)
+            .saturating_add(w)
+            .saturating_add(1)
+            <= inner.w
+        {
+            canvas.put_str(
+                inner.x + inner.w.saturating_sub(w),
+                footer_y,
+                w,
+                &pos,
+                muted,
+            );
+        }
     }
 }
 
@@ -633,16 +673,20 @@ fn draw_confirm(canvas: &mut Canvas, theme: &crate::config::Theme, confirm: &Con
         .bold();
     let msg = truncate_display(&confirm.message, inner.w as usize);
     canvas.put_str(inner.x, inner.y, inner.w, &msg, text);
-    if !confirm.detail.is_empty() {
+    if !confirm.detail.is_empty() && inner.h >= 4 {
         let detail = truncate_display(&confirm.detail, inner.w as usize);
         canvas.put_str(inner.x, inner.y + 1, inner.w, &detail, muted);
     }
     let footer_y = inner.y + inner.h - 1;
     let mut x = inner.x;
-    x = canvas.put_str(x, footer_y, 3, "[y]", key_style);
-    x = canvas.put_str(x, footer_y, 10, " confirm   ", muted);
-    x = canvas.put_str(x, footer_y, 3, "[n]", key_style);
-    let _ = canvas.put_str(x, footer_y, 10, " cancel", muted);
+    let mut left = inner.w;
+    x = canvas.put_str(x, footer_y, left.min(3), "[y]", key_style);
+    left = left.saturating_sub(x - inner.x);
+    x = canvas.put_str(x, footer_y, left.min(10), " confirm   ", muted);
+    left = left.saturating_sub(x - inner.x);
+    x = canvas.put_str(x, footer_y, left.min(3), "[n]", key_style);
+    left = left.saturating_sub(x - inner.x);
+    let _ = canvas.put_str(x, footer_y, left.min(8), " cancel", muted);
 }
 
 fn draw_prompt(canvas: &mut Canvas, theme: &crate::config::Theme, prompt: &PromptState) {
@@ -662,17 +706,17 @@ fn draw_prompt(canvas: &mut Canvas, theme: &crate::config::Theme, prompt: &Promp
     canvas.put_str(inner.x, inner.y, 2, "❯ ", accent);
     let value = prompt.line.text();
     let max = inner.w.saturating_sub(2);
-    let shown = truncate_display(&value, max as usize);
     let x = inner.x + 2;
-    if value.is_empty() {
+    let cursor_x = if value.is_empty() {
         canvas.put_str(x, inner.y, max, &prompt.placeholder, muted);
+        x
     } else {
+        let (shown, offset) = input_window(&prompt.line, max as usize);
         canvas.put_str(x, inner.y, max, &shown, text);
-    }
-    let before: String = prompt.line.chars[..prompt.line.cursor].iter().collect();
-    let cursor_x = x + text_width(&before).min(max as usize) as u16;
+        x + offset as u16
+    };
     canvas.set_cursor(Some(crate::render::CursorView {
-        x: cursor_x.min(inner.x + inner.w),
+        x: cursor_x.min(inner.x + inner.w.saturating_sub(1)),
         y: inner.y,
         visible: true,
         shape: 5,
@@ -738,6 +782,29 @@ mod tests {
                 category: PaletteCategory::Command,
             },
         ]
+    }
+
+    #[test]
+    fn input_line_is_bounded() {
+        let mut line = InputLine::new("");
+        line.insert_str(&"x".repeat(MAX_INPUT_CHARS + 100));
+        assert_eq!(line.chars.len(), MAX_INPUT_CHARS);
+        line.insert('y');
+        assert_eq!(line.chars.len(), MAX_INPUT_CHARS);
+    }
+
+    #[test]
+    fn input_window_keeps_cursor_visible() {
+        let mut line = InputLine::new("");
+        line.insert_str("0123456789abcdef");
+        let (shown, offset) = input_window(&line, 8);
+        assert!(shown.chars().count() <= 8);
+        assert!(offset < 8);
+        assert!(shown.contains('f'));
+        line.home();
+        let (shown, offset) = input_window(&line, 8);
+        assert_eq!(offset, 0);
+        assert!(shown.starts_with('0'));
     }
 
     #[test]

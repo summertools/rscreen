@@ -131,6 +131,102 @@ fn config_print_init_and_overwrite() {
 }
 
 #[test]
+fn session_names_are_validated_and_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let env = Env::new();
+    let (ok, _, err) = env.run(&["new", "../escape", "--detached"]);
+    assert!(!ok);
+    assert!(err.contains("session name"), "{}", err);
+    let (ok, _, err) = env.run(&["attach", "../escape"]);
+    assert!(!ok);
+    assert!(err.contains("session name"), "{}", err);
+    assert!(!env._dir.path().join("escape.sock").exists());
+    assert!(!Path::new("/tmp/escape.sock").exists());
+
+    let (ok, _, err) = env.run(&["new", "secure", "--detached"]);
+    assert!(ok, "{}", err);
+    let runtime_mode = std::fs::metadata(&env.runtime)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    let socket = env.runtime.join("secure.sock");
+    let socket_mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
+    assert_eq!(runtime_mode, 0o700, "runtime dir must be private");
+    assert_eq!(socket_mode, 0o600, "session socket must be private");
+    let _ = env.run(&["kill", "secure"]);
+}
+
+#[test]
+fn insecure_runtime_path_is_rejected() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("actual");
+    std::fs::create_dir(&target).unwrap();
+    let link = dir.path().join("runtime-link");
+    symlink(&target, &link).unwrap();
+    let out = Command::new(bin())
+        .env("RSCREEN_RUNTIME_DIR", &link)
+        .args(["new", "nope", "--detached"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("not a directory") || err.contains("not private"),
+        "{}",
+        err
+    );
+
+    let file = dir.path().join("runtime-file");
+    std::fs::write(&file, b"x").unwrap();
+    let out = Command::new(bin())
+        .env("RSCREEN_RUNTIME_DIR", &file)
+        .args(["ls"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("runtime directory"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn unsafe_config_targets_are_ignored() {
+    use std::os::unix::fs::symlink;
+
+    let env = Env::new();
+    let (ok, _, err) = env.run(&["new", "safe-config", "--detached"]);
+    assert!(ok, "{}", err);
+    // Replace the regular config with a symlink to a device. Loading must warn
+    // and fall back to defaults instead of hanging or executing it.
+    std::fs::remove_file(&env.config).unwrap();
+    symlink("/dev/zero", &env.config).unwrap();
+    let (ok, _, err) = env.run(&["attach", "safe-config"]);
+    assert!(!ok); // no tty in the test, but config loading must warn first
+    assert!(
+        err.contains("cannot read") || err.contains("not a regular file"),
+        "{}",
+        err
+    );
+    let _ = env.run(&["kill", "safe-config"]);
+
+    let env2 = Env::new();
+    let (ok, _, err) = env2.run(&["new", "safe-config2", "--detached"]);
+    assert!(ok, "{}", err);
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&env2.config, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let (ok, _, err) = env2.run(&["attach", "safe-config2"]);
+    assert!(!ok);
+    assert!(err.contains("group/world-writable"), "{}", err);
+    let _ = env2.run(&["kill", "safe-config2"]);
+}
+
+#[test]
 fn detached_session_survives_and_is_queryable() {
     let env = Env::new();
     let (ok, _, err) = env.run(&["new", "survivor", "--detached"]);

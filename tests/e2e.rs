@@ -112,6 +112,10 @@ struct TestClient {
 
 impl TestClient {
     fn connect(socket: &std::path::Path) -> Self {
+        Self::connect_sized(socket, 80, 24)
+    }
+
+    fn connect_sized(socket: &std::path::Path, cols: u16, rows: u16) -> Self {
         let mut stream = UnixStream::connect(socket).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_millis(150)))
@@ -120,13 +124,13 @@ impl TestClient {
             &mut stream,
             &ClientMsg::Hello {
                 version: PROTOCOL_VERSION,
-                cols: 80,
-                rows: 24,
+                cols,
+                rows,
                 caps: rscreen::protocol::Caps { truecolor: true },
             },
         )
         .unwrap();
-        let mut terminal = Terminal::new(80, 24, 5000);
+        let mut terminal = Terminal::new(cols as usize, rows as usize, 5000);
         // Welcome must arrive first.
         loop {
             match read_msg_timeout::<ServerMsg>(&mut stream, Duration::from_secs(2)).unwrap() {
@@ -141,8 +145,8 @@ impl TestClient {
         let mut client = Self {
             stream,
             terminal,
-            width: 80,
-            height: 24,
+            width: cols,
+            height: rows,
             raw: Vec::new(),
         };
         client.pump(300);
@@ -564,6 +568,15 @@ fn confirm_dialog_cancel_and_confirm() {
         "cancel did not close dialog"
     );
     assert_eq!(server.info().windows, 2);
+    // Enter must not confirm a destructive action.
+    client.send(b"\x01k");
+    assert!(client.wait_for("Confirm", 2000));
+    client.send(b"\r");
+    assert!(
+        client.wait_until(|t| !t.contains("Confirm"), 2000),
+        "Enter did not cancel confirmation"
+    );
+    assert_eq!(server.info().windows, 2);
     client.send(b"\x01k");
     assert!(client.wait_for("Confirm", 2000));
     client.send(b"y");
@@ -738,6 +751,197 @@ fn osc_title_updates_the_window_tab() {
         "title missing:\n{}",
         client.text()
     );
+    client.detach();
+}
+
+#[test]
+fn clients_with_different_sizes_keep_working() {
+    let server = TestServer::start();
+    let mut small = server.client();
+    assert!(small.wait_for("READY", 3000));
+    let mut large = TestClient::connect_sized(&server.socket, 120, 40);
+    assert!(large.wait_for("READY", 3000));
+    let info = server.info();
+    assert_eq!(info.clients, 2);
+    assert_eq!((info.cols, info.rows), (80, 24));
+    large.send_str("ping\r");
+    assert!(large.wait_for("GOT:ping", 3000));
+    let info = server.info();
+    assert_eq!((info.cols, info.rows), (120, 40));
+    // Both clients must keep receiving valid frames after the session is
+    // resized to the active client's dimensions.
+    assert!(small.wait_until(|t| t.contains(&server.name), 3000));
+    small.send_str("pong\r");
+    assert!(small.wait_for("GOT:pong", 3000));
+    let info = server.info();
+    assert_eq!((info.cols, info.rows), (80, 24));
+    assert!(large.wait_until(|t| t.contains(&server.name), 3000));
+    small.detach();
+    large.detach();
+}
+
+#[test]
+fn malformed_protocol_does_not_kill_the_session() {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+
+    let server = TestServer::start();
+    let _client = server.client();
+    let mut bad = UnixStream::connect(&server.socket).unwrap();
+    bad.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    // A complete frame with an unknown message tag.
+    bad.write_all(&1u32.to_le_bytes()).unwrap();
+    bad.write_all(&[0xff]).unwrap();
+    let msg = read_msg_timeout::<ServerMsg>(&mut bad, Duration::from_secs(1)).unwrap();
+    assert!(matches!(msg, Some(ServerMsg::Error(_))));
+    // The session itself must still answer and serve frames.
+    let info = server.info();
+    assert_eq!(info.name, server.name);
+}
+
+#[test]
+fn wide_characters_survive_composition() {
+    let mut config = Config::default();
+    config.confirm_kill = false;
+    config.shell = "/bin/sh".into();
+    config.shell_args = vec!["-c".into(), "printf 'wide: 中A\\n'; sleep 2".into()];
+    let server = TestServer::start_with(config);
+    let mut client = server.client();
+    assert!(
+        client.wait_for("wide: 中A", 3000),
+        "wide glyph was dropped:\n{}",
+        client.text()
+    );
+    client.send(b"\x01[");
+    assert!(client.wait_until(|t| t.contains("COPY"), 2000));
+    assert!(
+        client.has("wide: 中A"),
+        "wide glyph was dropped in copy mode:\n{}",
+        client.text()
+    );
+    client.send(b"q");
+    client.detach();
+}
+
+#[test]
+fn chatty_pane_does_not_starve_the_server() {
+    let mut config = Config::default();
+    config.confirm_kill = false;
+    config.shell = "/bin/sh".into();
+    config.shell_args = vec!["-c".into(), "yes flood".into()];
+    let server = TestServer::start_with(config);
+    let mut client = server.client();
+    assert!(client.wait_for("flood", 3000));
+    // Info must be served while the pane is producing output continuously.
+    let info = server.info();
+    assert_eq!(info.name, server.name);
+    client.detach();
+}
+
+#[test]
+fn child_does_not_inherit_the_pty_master() {
+    let mut config = Config::default();
+    config.confirm_kill = false;
+    config.shell = "/bin/sh".into();
+    config.shell_args = vec![
+        "-c".into(),
+        "ls -l /proc/self/fd 2>/dev/null; sleep 1".into(),
+    ];
+    let server = TestServer::start_with(config);
+    let mut client = server.client();
+    assert!(client.wait_for("fd", 3000));
+    let text = client.text();
+    assert!(
+        !text.contains("ptmx"),
+        "child inherited a PTY master:\n{}",
+        text
+    );
+    client.detach();
+}
+
+#[test]
+fn input_after_modal_submit_is_not_lost() {
+    let server = TestServer::start();
+    let mut client = server.client();
+    assert!(client.wait_for("READY", 3000));
+    client.send(b"\x01A");
+    assert!(client.wait_for("Rename window", 2000));
+    client.send(b"\x15workspace\rping\r");
+    assert!(
+        client.wait_until(|t| t.contains("workspace"), 2500),
+        "rename/submit failed:\n{}",
+        client.text()
+    );
+    assert!(
+        client.wait_for("GOT:ping", 3000),
+        "input after modal submit was lost:\n{}",
+        client.text()
+    );
+    client.detach();
+}
+
+#[test]
+fn modified_keys_do_not_cancel_text_prompts() {
+    let server = TestServer::start();
+    let mut client = server.client();
+    assert!(client.wait_for("READY", 3000));
+    client.send(b"\x01A");
+    assert!(client.wait_for("Rename window", 2000));
+    // Shift+Left is a complete CSI sequence; it must not act as Escape.
+    client.send(b"\x1b[1;2D");
+    client.pump(150);
+    assert!(
+        client.has("Rename window"),
+        "modified key closed the prompt:\n{}",
+        client.text()
+    );
+    client.send(b"\x1b");
+    client.pump(100);
+    client.detach();
+}
+
+#[test]
+fn wheel_over_another_pane_does_not_steal_focus() {
+    let server = TestServer::start();
+    let mut client = server.client();
+    assert!(client.wait_for("READY", 3000));
+    client.send(b"\x01|");
+    assert!(client.wait_until(|t| t.contains("2 panes"), 3000));
+    // Focus is on the right pane after splitting; wheel over the left pane.
+    client.send(b"\x1b[<64;10;6M");
+    client.pump(350);
+    assert!(
+        !client.has("COPY"),
+        "wheel over a non-focused pane entered copy mode:\n{}",
+        client.text()
+    );
+    client.detach();
+}
+
+#[test]
+fn click_in_copy_mode_does_not_copy_a_single_cell() {
+    let server = TestServer::start();
+    let mut client = server.client();
+    assert!(client.wait_for("READY", 3000));
+    client.send(b"\x01[");
+    assert!(client.wait_until(|t| t.contains("COPY"), 2000));
+    let before = client.raw.len();
+    client.send(b"\x1b[<0;3;2M");
+    client.send(b"\x1b[<0;3;2m");
+    client.pump(350);
+    assert!(
+        client.has("COPY"),
+        "a click exited copy mode:\n{}",
+        client.text()
+    );
+    assert!(
+        !client.raw[before..]
+            .iter()
+            .any(|b| b.windows(4).any(|w| w == b"\x1b]52")),
+        "a click copied a single cell"
+    );
+    client.send(b"q");
+    client.pump(100);
     client.detach();
 }
 

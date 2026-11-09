@@ -1,6 +1,8 @@
 //! Configuration loading and the visual theme.
 
 use std::collections::HashMap;
+use std::io::Read;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 use serde::Deserialize;
@@ -101,6 +103,7 @@ pub struct Config {
     pub status_rows: u16,
     pub mouse: bool,
     pub mouse_select: bool,
+    pub app_clipboard: bool,
     pub bell: BellMode,
     pub clock: bool,
     pub confirm_kill: bool,
@@ -120,6 +123,7 @@ impl Default for Config {
             status_rows: 1,
             mouse: true,
             mouse_select: true,
+            app_clipboard: true,
             bell: BellMode::Visual,
             clock: true,
             confirm_kill: true,
@@ -134,23 +138,76 @@ impl Config {
     pub fn load() -> (Self, Vec<String>) {
         let mut warnings = Vec::new();
         let path = paths::config_path();
-        if !path.exists() {
-            return (Self::default(), warnings);
-        }
-        match std::fs::read_to_string(&path) {
-            Ok(text) => match Self::parse(&text) {
-                Ok(cfg) => (cfg, warnings),
-                Err(err) => {
-                    warnings.push(format!(
-                        "config {}: {} (using defaults)",
-                        path.display(),
-                        err
-                    ));
-                    (Self::default(), warnings)
-                }
-            },
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return (Self::default(), warnings)
+            }
             Err(err) => {
                 warnings.push(format!("cannot read {}: {}", path.display(), err));
+                return (Self::default(), warnings);
+            }
+        };
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                warnings.push(format!("cannot inspect {}: {}", path.display(), err));
+                return (Self::default(), warnings);
+            }
+        };
+        if !metadata.file_type().is_file() {
+            warnings.push(format!(
+                "config {} is not a regular file; using defaults",
+                path.display()
+            ));
+            return (Self::default(), warnings);
+        }
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            warnings.push(format!(
+                "config {} is not owned by the current user; using defaults",
+                path.display()
+            ));
+            return (Self::default(), warnings);
+        }
+        if metadata.mode() & 0o022 != 0 {
+            warnings.push(format!(
+                "config {} is group/world-writable; using defaults",
+                path.display()
+            ));
+            return (Self::default(), warnings);
+        }
+        if metadata.len() > 1024 * 1024 {
+            warnings.push(format!(
+                "config {} is too large; using defaults",
+                path.display()
+            ));
+            return (Self::default(), warnings);
+        }
+        let mut text = String::new();
+        let mut limited = file.take(1024 * 1024 + 1);
+        if let Err(err) = limited.read_to_string(&mut text) {
+            warnings.push(format!("cannot read {}: {}", path.display(), err));
+            return (Self::default(), warnings);
+        }
+        if text.len() > 1024 * 1024 {
+            warnings.push(format!(
+                "config {} is too large; using defaults",
+                path.display()
+            ));
+            return (Self::default(), warnings);
+        }
+        match Self::parse(&text) {
+            Ok(cfg) => (cfg, warnings),
+            Err(err) => {
+                warnings.push(format!(
+                    "config {}: {} (using defaults)",
+                    path.display(),
+                    err
+                ));
                 (Self::default(), warnings)
             }
         }
@@ -191,6 +248,9 @@ impl Config {
         if let Some(v) = file.general.mouse_select {
             cfg.mouse_select = v;
         }
+        if let Some(v) = file.general.app_clipboard {
+            cfg.app_clipboard = v;
+        }
         if let Some(v) = file.general.bell.as_deref() {
             cfg.bell = BellMode::parse(v).ok_or_else(|| format!("invalid bell mode {:?}", v))?;
         }
@@ -222,11 +282,23 @@ impl Config {
         SAMPLE_CONFIG
     }
 
-    pub fn write_sample(&self, path: &Path) -> std::io::Result<()> {
+    pub fn write_sample(&self, path: &Path, overwrite: bool) -> std::io::Result<()> {
+        use std::io::Write;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, SAMPLE_CONFIG)
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+        if overwrite {
+            options.create(true).truncate(true);
+        } else {
+            options.create_new(true);
+        }
+        let mut file = options.open(path)?;
+        file.write_all(SAMPLE_CONFIG.as_bytes())?;
+        file.flush()
     }
 }
 
@@ -249,6 +321,7 @@ struct GeneralFile {
     status_rows: Option<u16>,
     mouse: Option<bool>,
     mouse_select: Option<bool>,
+    app_clipboard: Option<bool>,
     bell: Option<String>,
     clock: Option<bool>,
     confirm_kill: Option<bool>,
@@ -367,6 +440,7 @@ scrollback = 5000       # lines of history per pane
 status_rows = 1         # 1 = compact bar, 2 = bar + key hints
 mouse = true            # wheel scrolling and click-to-focus
 mouse_select = true     # drag to select text (auto-copies)
+app_clipboard = true    # allow applications to set the system clipboard via OSC 52
 bell = "visual"         # visual | audible | off
 clock = true            # show the time in the status bar
 confirm_kill = true     # ask before killing a pane/window

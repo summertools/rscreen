@@ -85,7 +85,7 @@ pub fn main_entry(cli: Cli) -> i32 {
     match run(cli) {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("rscreen: {:#}", err);
+            eprintln!("rscreen: {}", util::terminal_safe(&format!("{:#}", err)));
             1
         }
     }
@@ -99,13 +99,14 @@ fn run(cli: Cli) -> Result<i32> {
         Some(command) => command,
         None => return attach_or_create_bare(&cli),
     };
+    paths::ensure_runtime_dir()?;
     match command {
         Command::Server { name, cwd } => {
             util::validate_session_name(&name).map_err(|e| anyhow!(e))?;
             paths::ensure_runtime_dir()?;
             let (config, warnings) = Config::load();
             for warning in warnings {
-                eprintln!("rscreen: {}", warning);
+                eprintln!("rscreen: {}", util::terminal_safe(&warning));
             }
             let socket = paths::socket_path(&name);
             if !paths::socket_path_fits(&socket) {
@@ -202,11 +203,11 @@ fn run(cli: Cli) -> Result<i32> {
                         path.display()
                     );
                 }
-                Config::default().write_sample(&path)?;
-                println!("wrote {}", path.display());
+                Config::default().write_sample(&path, force)?;
+                println!("wrote {}", util::terminal_safe(&path.display().to_string()));
                 return Ok(0);
             }
-            println!("{}", path.display());
+            println!("{}", util::terminal_safe(&path.display().to_string()));
             if path.exists() {
                 println!("(exists — use `rscreen config --print` to see the sample)");
             } else {
@@ -281,7 +282,7 @@ fn attach_named(name: &str) -> Result<i32> {
     }
     let (config, warnings) = Config::load();
     for warning in warnings {
-        eprintln!("rscreen: {}", warning);
+        eprintln!("rscreen: {}", util::terminal_safe(&warning));
     }
     let outcome = client::attach(AttachOptions {
         socket,
@@ -290,15 +291,15 @@ fn attach_named(name: &str) -> Result<i32> {
     })?;
     match outcome {
         AttachOutcome::Detached(message) => {
-            println!("[{}]", message);
+            println!("[{}]", util::terminal_safe(&message));
             Ok(0)
         }
         AttachOutcome::Ended(message) => {
-            println!("[{}]", message);
+            println!("[{}]", util::terminal_safe(&message));
             Ok(0)
         }
         AttachOutcome::Error(message) => {
-            eprintln!("rscreen: {}", message);
+            eprintln!("rscreen: {}", util::terminal_safe(&message));
             Ok(1)
         }
     }
@@ -425,7 +426,30 @@ fn create_session(name: &str) -> Result<()> {
     if live_info(name).is_some() {
         bail!("session {:?} already exists", name);
     }
-    let _ = std::fs::remove_file(&socket);
+    // A timeout is not proof of death. Only remove a socket when the kernel
+    // explicitly refuses the connection.
+    if socket.exists() {
+        match UnixStream::connect(&socket) {
+            Ok(_) => bail!(
+                "session {:?} is alive but did not answer a query; refusing to replace it",
+                name
+            ),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                let _ = std::fs::remove_file(&socket);
+            }
+            Err(err) => bail!(
+                "cannot verify existing session {:?} at {}: {}",
+                name,
+                socket.display(),
+                err
+            ),
+        }
+    }
 
     let cwd = std::env::current_dir()
         .unwrap_or_else(|_| crate::pty::home_dir().unwrap_or_else(|| PathBuf::from("/")));
@@ -451,6 +475,9 @@ fn create_session(name: &str) -> Result<()> {
         }
         if Instant::now() >= deadline {
             let tail = read_log_tail(&log_path);
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&socket);
             bail!(
                 "timed out waiting for session {:?} to start{}\nlog: {}",
                 name,

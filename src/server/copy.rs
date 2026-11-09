@@ -5,6 +5,8 @@ use crate::layout::PaneId;
 use crate::server::input::Key;
 use crate::term::{Cursor, Row};
 
+const MAX_SEARCH_MATCHES: usize = 10_000;
+
 #[derive(Clone)]
 pub struct CopySnapshot {
     pub cols: usize,
@@ -375,31 +377,36 @@ impl CopyState {
         if q.is_empty() {
             return;
         }
-        for (row, line) in self.snapshot.rows.iter().enumerate() {
-            let text = {
-                let mut s = String::new();
-                for cell in &line.cells {
-                    if cell.cont {
-                        continue;
-                    }
-                    s.push(cell.ch);
-                    if let Some(extra) = &cell.extra {
-                        s.push_str(extra);
+        let qchars: Vec<char> = q.chars().collect();
+        if qchars.is_empty() {
+            return;
+        }
+        'rows: for (row, line) in self.snapshot.rows.iter().enumerate() {
+            // Lowercasing can expand one source character into several
+            // lowercase chars (İ -> i + combining dot). Keep a parallel map
+            // back to the originating cell column so match highlights and
+            // jumps stay aligned.
+            let mut lower: Vec<char> = Vec::new();
+            let mut cols: Vec<usize> = Vec::new();
+            for (col, cell) in line.cells.iter().enumerate() {
+                if cell.cont {
+                    continue;
+                }
+                for ch in cell.text().chars() {
+                    for folded in ch.to_lowercase() {
+                        lower.push(folded);
+                        cols.push(col);
                     }
                 }
-                s
-            };
-            let lower: Vec<char> = text.to_lowercase().chars().collect();
-            let qchars: Vec<char> = q.chars().collect();
-            if qchars.is_empty() || lower.len() < qchars.len() {
+            }
+            if lower.len() < qchars.len() {
                 continue;
             }
-            let cols = self.row_col_map(row);
             let mut i = 0;
             while i + qchars.len() <= lower.len() {
                 if lower[i..i + qchars.len()] == qchars[..] {
-                    let start = cols.get(i).copied().unwrap_or(0);
-                    let end_col = cols.get(i + qchars.len() - 1).copied().unwrap_or(start);
+                    let start = cols[i];
+                    let end_col = cols[i + qchars.len() - 1];
                     let cell_width = line
                         .cells
                         .get(end_col)
@@ -408,6 +415,9 @@ impl CopyState {
                         .max(1);
                     let end = (end_col + cell_width).min(self.snapshot.cols);
                     self.matches.push(SearchMatch { row, start, end });
+                    if self.matches.len() >= MAX_SEARCH_MATCHES {
+                        break 'rows;
+                    }
                     i += qchars.len();
                 } else {
                     i += 1;
@@ -563,8 +573,10 @@ impl CopyState {
                     text.push_str(extra);
                 }
             }
-            while text.ends_with(' ') {
-                text.pop();
+            if !line.wrapped || row == end.0 {
+                while text.ends_with(' ') {
+                    text.pop();
+                }
             }
             out.push_str(&text);
             if row != end.0 && !line.wrapped {
@@ -666,6 +678,73 @@ mod tests {
         assert_eq!(copy.cursor_row, 1);
         copy.jump_match(true, 3);
         assert_eq!(copy.cursor_row, 2);
+    }
+
+    #[test]
+    fn wrapped_lines_keep_real_trailing_spaces() {
+        let mut c0: Vec<_> = "abcd "
+            .chars()
+            .map(|c| crate::term::Cell::ch(c, Style::default()))
+            .collect();
+        c0.truncate(5);
+        let c1: Vec<_> = "e"
+            .chars()
+            .map(|c| crate::term::Cell::ch(c, Style::default()))
+            .collect();
+        let snapshot = CopySnapshot {
+            cols: 5,
+            screen_rows: 2,
+            rows: vec![
+                Row {
+                    cells: c0,
+                    wrapped: true,
+                },
+                Row {
+                    cells: c1,
+                    wrapped: false,
+                },
+            ],
+            cursor: Cursor {
+                row: 0,
+                col: 0,
+                pending_wrap: false,
+            },
+            title: "test".into(),
+            reverse: false,
+        };
+        let mut copy = CopyState::new(1, 1, snapshot);
+        copy.anchor = Some((0, 0));
+        copy.selecting = true;
+        copy.cursor_row = 1;
+        copy.cursor_col = 0;
+        assert_eq!(copy.selection_text(), "abcd e");
+    }
+
+    #[test]
+    fn search_survives_lowercase_expansion() {
+        let mut cells = Vec::new();
+        for ch in "İaaa".chars() {
+            cells.push(crate::term::Cell::ch(ch, Style::default()));
+        }
+        let snapshot = CopySnapshot {
+            cols: 4,
+            screen_rows: 1,
+            rows: vec![Row {
+                cells,
+                wrapped: false,
+            }],
+            cursor: Cursor {
+                row: 0,
+                col: 0,
+                pending_wrap: false,
+            },
+            title: "test".into(),
+            reverse: false,
+        };
+        let mut copy = CopyState::new(1, 1, snapshot);
+        copy.set_search("a", true, 1);
+        let starts: Vec<usize> = copy.matches.iter().map(|m| m.start).collect();
+        assert_eq!(starts, vec![1, 2, 3]);
     }
 
     #[test]

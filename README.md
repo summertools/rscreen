@@ -111,7 +111,7 @@ to the focused application. Prefix keys are configurable.
 | `C-a c` | New window |
 | `C-a n` / `C-a p` | Next / previous window |
 | `C-a Tab` / `C-a S-Tab` | Next / previous window |
-| `C-a 1..9` / `C-a 0` | Jump to window number (0 = window 10) |
+| `C-a 1..9` / `C-a 0` | Jump to window position (0 = 10; numbers renumber when windows close) |
 | `C-a w` or `C-a "` | Window picker |
 | `C-a A` | Rename the current window |
 | `C-a k` | Kill the current window (confirmation) |
@@ -123,7 +123,7 @@ to the focused application. Prefix keys are configurable.
 | `C-a \|` | Split right |
 | `C-a -` / `C-a S` | Split down |
 | `C-a o` | Focus next pane |
-| `C-a ;` | Focus previous pane |
+| `C-a ;` | Focus the last active pane |
 | `C-a ↑ ↓ ← →` | Focus pane in a direction |
 | `C-a H J K L` | Resize the focused pane |
 | `C-a z` | Zoom / unzoom |
@@ -154,7 +154,8 @@ trailing blanks.
 
 - Wheel scrolls the focused pane (enters copy mode when needed).
 - Drag selects text and copies it on release. Set `mouse_select = false` to
-  disable this and keep native terminal selection.
+  disable rscreen's drag selection; like all mouse-enabled multiplexers, the
+  terminal's native selection then still requires **Shift** (or `mouse = false`).
 - Click focuses a pane; click a window tab to switch windows.
 - Applications that request mouse reporting receive translated SGR/X10 events.
 - In the alternate screen with mode 1007 enabled, the wheel is sent to the
@@ -184,6 +185,7 @@ scrollback = 5000
 status_rows = 1         # 1 = compact, 2 = status + key hints
 mouse = true
 mouse_select = true
+app_clipboard = true    # allow applications to set the clipboard via OSC 52
 bell = "visual"         # visual | audible | off
 clock = true
 confirm_kill = true
@@ -233,12 +235,32 @@ Runtime files live in `$XDG_RUNTIME_DIR/rscreen` (fallback
 `/tmp/rscreen-$UID`): session sockets, lock files and per-session logs under
 `logs/`. The directory is mode `0700` and sockets are `0600`.
 
+## Security & trust
+
+rscreen is a per-user tool, not a multi-user service.
+
+- Session sockets live in a private `0700` runtime directory, are mode `0600`,
+  and the server verifies peer credentials on Linux. Other users cannot attach.
+- Processes running as the same user are trusted. They can attach, read the
+  screen, use the clipboard and kill the session, just as they could signal the
+  server directly. Do not run untrusted code in a session you consider private.
+- Configuration files must be regular files owned by the current user and must
+  not be group/world-writable. Symlinked or FIFO/device config paths are ignored
+  with a warning.
+- Applications may set the clipboard through OSC 52 by default. Set
+  `app_clipboard = false` to keep the system clipboard under rscreen's copy-mode
+  control. Bracketed-paste delimiters are stripped from pasted data, and OSC 8
+  hyperlink schemes are restricted to common safe schemes.
+- A killed server cannot restore the terminal (SIGKILL is uncatchable), but
+  normal exits, errors, signals and panics run the terminal restore guard.
+
 ## Development
 
 ```sh
 cargo test              # unit + end-to-end protocol/UI tests
 cargo clippy --all-targets
 cargo fmt --all
+cargo audit             # dependency advisories (RustSec)
 ```
 
 The integration tests spawn real daemons and PTYs, attach over the real binary
@@ -253,14 +275,18 @@ To regenerate the README screenshots (needs Python + Pillow):
 
 ## Releases
 
+The current development version is 0.1.1, a security/quality follow-up to the
+first release. It changes the local wire protocol to a bounded custom codec;
+sessions started by 0.1.0 must be killed and recreated after upgrading.
+
 Version tags (`v*`) are built by GitHub Actions for Linux x86_64 and aarch64.
 Each GitHub Release contains a `rscreen-vX.Y.Z-<target>.tar.gz` archive with
 the binary, README, license and changelog, plus a SHA-256 checksum. See
 [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ```sh
-git tag -a v0.1.0 -m "rscreen v0.1.0"
-git push origin v0.1.0
+git tag -a v0.1.1 -m "rscreen v0.1.1"
+git push origin v0.1.1
 ```
 
 ## Limitations
@@ -268,6 +294,9 @@ git push origin v0.1.0
 - Unix only; the server relies on PTYs and Unix sockets.
 - Scrollback is not reflowed when the terminal width changes. History lines are
   truncated/padded instead; the live screen keeps its top-left content.
+- Scrollback is capped at approximately 32 MiB per pane (in addition to the
+  configured line count), and at most eight clients may attach to one session.
+- Client dimensions are clamped to 600x300 cells to bound per-client memory.
 - Multiple attached clients share one layout. The most recently active client
   controls the pane dimensions; other clients get a consistent view of the same
   session at their own frame size.
@@ -277,7 +306,10 @@ git push origin v0.1.0
   is not.
 - Copy mode on the alternate screen can only copy the alternate screen contents;
   primary-screen history is preserved after the application exits.
-- OSC 52 clipboard sync depends on the outer terminal's policy.
+- OSC 52 clipboard sync depends on the outer terminal's policy. Application
+  clipboard writes can be disabled with `app_clipboard = false`.
+- Window numbers are positional (like tabs), not stable IDs; they renumber when
+  a window is closed.
 
 ## License
 

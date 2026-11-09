@@ -38,14 +38,14 @@ pub fn attach(options: AttachOptions) -> Result<AttachOutcome> {
     stream.set_nonblocking(true)?;
 
     let _flags = FdFlags::set_nonblocking(0)?;
-    let guard = TerminalGuard::new(&options.name, options.config.mouse)?;
-
     let winch = Arc::new(AtomicBool::new(false));
     let interrupted = Arc::new(AtomicBool::new(false));
     let _ = signal_hook::flag::register(signal_hook::consts::SIGWINCH, winch.clone());
     let _ = signal_hook::flag::register(signal_hook::consts::SIGTERM, interrupted.clone());
     let _ = signal_hook::flag::register(signal_hook::consts::SIGINT, interrupted.clone());
     let _ = signal_hook::flag::register(signal_hook::consts::SIGHUP, interrupted.clone());
+    let _ = signal_hook::flag::register(signal_hook::consts::SIGQUIT, interrupted.clone());
+    let guard = TerminalGuard::new(&options.name, options.config.mouse)?;
 
     let caps = Caps {
         truecolor: detect_truecolor(),
@@ -256,9 +256,13 @@ pub fn attach(options: AttachOptions) -> Result<AttachOutcome> {
     Ok(outcome.unwrap_or_else(|| AttachOutcome::Ended(format!("{} ended", options.name))))
 }
 
-fn queue_msg<T: serde::Serialize>(out: &mut Vec<u8>, msg: &T) -> Result<()> {
+fn queue_msg<T: crate::protocol::WireMessage>(out: &mut Vec<u8>, msg: &T) -> Result<()> {
+    const MAX_QUEUE: usize = 16 * 1024 * 1024;
     let bytes = crate::protocol::encode(msg)
         .map_err(|e| anyhow::anyhow!("protocol encode error: {}", e))?;
+    if out.len().saturating_add(bytes.len()) > MAX_QUEUE {
+        anyhow::bail!("input queue is full; the session server is not keeping up");
+    }
     out.extend_from_slice(&bytes);
     Ok(())
 }
@@ -392,9 +396,13 @@ impl TerminalGuard {
             seq.push_str("\x1b[22;0t"); // save title
             seq.push_str("\x1b[H\x1b[2J");
             seq.push_str("\x1b[?25l");
+            seq.push_str(&format!(
+                "\x1b[2;1H\x1b[2m  rscreen · connecting to {}…\x1b[0m",
+                title
+            ));
             seq.push_str("\x1b[?2004h"); // bracketed paste
             if mouse {
-                seq.push_str("\x1b[?1002h\x1b[?1006h");
+                seq.push_str("\x1b[?1003h\x1b[?1006h");
             }
             seq.push_str(&format!("\x1b]2;rscreen: {}\x1b\\", title));
             if let Err(err) = io::stdout().write_all(seq.as_bytes()) {
@@ -416,7 +424,7 @@ impl TerminalGuard {
         seq.push_str("\x1b[0m");
         seq.push_str("\x1b[0 q");
         if self.mouse {
-            seq.push_str("\x1b[?1002l\x1b[?1006l");
+            seq.push_str("\x1b[?1003l\x1b[?1006l");
         }
         seq.push_str("\x1b[?2004l");
         seq.push_str("\x1b[?2026l");

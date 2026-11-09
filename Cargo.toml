@@ -1,6 +1,6 @@
 [package]
 name = "rscreen"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.85"
 description = "A modern, elegant terminal multiplexer inspired by GNU Screen"
@@ -20,7 +20,6 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
-bincode = "1.3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive", "wrap_help"] }
 libc = "0.2"

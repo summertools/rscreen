@@ -283,7 +283,7 @@ impl Layout {
         if leaves > 1 {
             // Draw separators even when the terminal is too small for the
             // outer frame and pane headers.
-            solve_borders(root, inner, &mut solved);
+            solve_borders(root, inner, (area.x, area.y), &mut solved);
         }
         solved
     }
@@ -398,7 +398,7 @@ fn solve_node(node: &Node, area: Rect, header: bool, out: &mut Vec<PanePlacement
     }
 }
 
-fn solve_borders(node: &Node, area: Rect, solved: &mut SolvedLayout) {
+fn solve_borders(node: &Node, area: Rect, origin: (u16, u16), solved: &mut SolvedLayout) {
     let Node::Split {
         dir,
         ratio,
@@ -416,12 +416,13 @@ fn solve_borders(node: &Node, area: Rect, solved: &mut SolvedLayout) {
             let (a, _b) = split_sizes(area.w, *ratio);
             let x = area.x + a;
             for y in area.y..area.bottom() {
-                set_border(solved, x, y);
+                set_border(solved, x - origin.0, y - origin.1);
             }
-            solve_borders(first, Rect::new(area.x, area.y, a, area.h), solved);
+            solve_borders(first, Rect::new(area.x, area.y, a, area.h), origin, solved);
             solve_borders(
                 second,
                 Rect::new(area.x + a + 1, area.y, area.w - a - 1, area.h),
+                origin,
                 solved,
             );
         }
@@ -432,12 +433,13 @@ fn solve_borders(node: &Node, area: Rect, solved: &mut SolvedLayout) {
             let (a, _b) = split_sizes(area.h, *ratio);
             let y = area.y + a;
             for x in area.x..area.right() {
-                set_border(solved, x, y);
+                set_border(solved, x - origin.0, y - origin.1);
             }
-            solve_borders(first, Rect::new(area.x, area.y, area.w, a), solved);
+            solve_borders(first, Rect::new(area.x, area.y, area.w, a), origin, solved);
             solve_borders(
                 second,
                 Rect::new(area.x, area.y + a + 1, area.w, area.h - a - 1),
+                origin,
                 solved,
             );
         }
@@ -564,6 +566,24 @@ mod tests {
             a.content.h + b.content.h,
             24 - 2 - 1 - 2 // frame + divider + two headers
         );
+    }
+
+    #[test]
+    fn offset_area_dividers_are_local() {
+        let mut layout = Layout::new(1);
+        layout.split(1, 2, Dir::Stacked).unwrap();
+        let solved = layout.solve(Rect::new(10, 20, 30, 10), true);
+        let internal: Vec<usize> = (1..9)
+            .filter(|y| {
+                solved.border[y * 30..(y + 1) * 30]
+                    .iter()
+                    .filter(|b| **b)
+                    .count()
+                    > 2
+            })
+            .collect();
+        assert!(!internal.is_empty());
+        assert!(solved.border[internal[0] * 30 + 15]);
     }
 
     #[test]

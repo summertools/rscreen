@@ -21,6 +21,11 @@ use vte::{Params, Perform};
 use super::cell::{char_width, Cell};
 use super::style::{attrs, Color, Style};
 
+/// Approximate per-pane scrollback budget. The line limit alone is not enough:
+/// wide terminals can make a few thousand lines consume hundreds of MiB.
+const SCROLLBACK_BYTE_LIMIT: usize = 32 * 1024 * 1024;
+const CELL_BYTES: usize = std::mem::size_of::<Cell>();
+
 /// Events produced while parsing output. The server reacts to these (bells,
 /// title changes, clipboard requests...).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,6 +117,7 @@ pub struct Buffer {
     pub wrapped: Vec<bool>,
     pub scrollback: VecDeque<Row>,
     pub scrollback_limit: usize,
+    pub scrollback_bytes: usize,
     pub cursor: Cursor,
     pub top: usize,
     pub bottom: usize,
@@ -128,6 +134,7 @@ impl Buffer {
             wrapped: vec![false; rows],
             scrollback: VecDeque::new(),
             scrollback_limit,
+            scrollback_bytes: 0,
             cursor: Cursor::default(),
             top: 0,
             bottom: rows - 1,
@@ -216,9 +223,21 @@ impl Buffer {
         if self.scrollback_limit == 0 {
             return;
         }
+        self.scrollback_bytes = self
+            .scrollback_bytes
+            .saturating_add(row.cells.len().saturating_mul(CELL_BYTES));
         self.scrollback.push_back(row);
-        while self.scrollback.len() > self.scrollback_limit {
-            self.scrollback.pop_front();
+        while self.scrollback.len() > self.scrollback_limit
+            || self.scrollback_bytes > SCROLLBACK_BYTE_LIMIT
+        {
+            if let Some(front) = self.scrollback.pop_front() {
+                self.scrollback_bytes = self
+                    .scrollback_bytes
+                    .saturating_sub(front.cells.len().saturating_mul(CELL_BYTES));
+            } else {
+                self.scrollback_bytes = 0;
+                break;
+            }
         }
     }
 
@@ -344,10 +363,12 @@ pub struct Screen {
     pub responses: Vec<u8>,
     pub events: Vec<Event>,
     saved: SavedState,
-    alt_return: Option<(Cursor, Style)>,
+    alt_return: Option<(SavedState, usize, usize)>,
     scrollback_limit: usize,
     /// OSC 8 hyperlink currently in effect.
     current_link: Option<Arc<str>>,
+    /// Last cell that received a printed glyph, used for combining marks.
+    last_print: Option<(usize, usize)>,
 }
 
 impl Screen {
@@ -381,6 +402,7 @@ impl Screen {
             alt_return: None,
             scrollback_limit,
             current_link: None,
+            last_print: None,
         }
     }
 
@@ -452,16 +474,34 @@ impl Screen {
     }
 
     fn move_up(&mut self, n: usize) {
-        let top = self.active().top;
+        let (top, row, rows) = {
+            let b = self.active();
+            (b.top, b.cursor.row, b.rows)
+        };
+        let target = row.saturating_sub(n);
+        let target = if row >= top {
+            target.max(top)
+        } else {
+            target.min(rows.saturating_sub(1))
+        };
         let b = self.active_mut();
-        b.cursor.row = b.cursor.row.saturating_sub(n).max(top);
+        b.cursor.row = target;
         b.cursor.pending_wrap = false;
     }
 
     fn move_down(&mut self, n: usize) {
-        let bottom = self.active().bottom;
+        let (bottom, row, rows) = {
+            let b = self.active();
+            (b.bottom, b.cursor.row, b.rows)
+        };
+        let target = row.saturating_add(n).min(rows.saturating_sub(1));
+        let target = if row <= bottom {
+            target.min(bottom)
+        } else {
+            target
+        };
         let b = self.active_mut();
-        b.cursor.row = (b.cursor.row + n).min(bottom);
+        b.cursor.row = target;
         b.cursor.pending_wrap = false;
     }
 
@@ -589,6 +629,9 @@ impl Screen {
     // ------------------------------------------------------------------
 
     fn append_combining(&mut self, c: char) {
+        if c.is_control() {
+            return;
+        }
         let (row, col, pending) = {
             let b = self.active();
             (b.cursor.row, b.cursor.col, b.cursor.pending_wrap)
@@ -598,7 +641,16 @@ impl Screen {
         } else if col > 0 {
             (row, col - 1)
         } else if row > 0 {
-            (row - 1, self.active().cols - 1)
+            let previous = (row - 1, self.active().cols - 1);
+            let wrapped = self.active().wrapped[row - 1];
+            // Only attach to the previous row when the cursor actually just
+            // auto-wrapped there. After CR/LF/CUP a combining mark has no
+            // preceding glyph on this line.
+            if wrapped && self.last_print == Some(previous) {
+                previous
+            } else {
+                return;
+            }
         } else {
             return;
         };
@@ -630,6 +682,12 @@ impl Screen {
     }
 
     fn put_char(&mut self, c: char) {
+        if c.is_control() {
+            // C1 controls can arrive as UTF-8 from an application. They must
+            // never become printable cells, otherwise a frame could smuggle
+            // escape-like bytes back to the outer terminal.
+            return;
+        }
         let width = char_width(c);
         if width == 0 {
             self.append_combining(c);
@@ -665,11 +723,23 @@ impl Screen {
                 col = self.active().cursor.col;
             } else {
                 let style = self.pen;
+                self.clear_wide_overlap(row, col, 1);
                 let b = self.active_mut();
                 b.get_mut(row, col).reset(style);
-                b.cursor.pending_wrap = true;
+                b.cursor.pending_wrap = false;
                 return;
             }
+        }
+        // A one-column screen cannot represent a double-width glyph even
+        // after wrapping. Keep the grid invariant intact.
+        if width == 2 && col + 1 >= cols {
+            let style = self.pen;
+            self.clear_wide_overlap(row, col, 1);
+            let b = self.active_mut();
+            b.get_mut(row, col).reset(style);
+            b.cursor.col = col.min(cols.saturating_sub(1));
+            b.cursor.pending_wrap = true;
+            return;
         }
 
         self.clear_wide_overlap(row, col, width);
@@ -697,6 +767,7 @@ impl Screen {
             b.cursor.row = row;
         }
         self.last_char = Some(c);
+        self.last_print = Some((row, col));
     }
 
     fn map_charset(&self, c: char) -> char {
@@ -761,6 +832,7 @@ impl Screen {
             }
             3 => {
                 b.scrollback.clear();
+                b.scrollback_bytes = 0;
             }
             _ => {}
         }
@@ -1016,7 +1088,18 @@ impl Screen {
         self.alternate = Some(alt);
         self.alt_active = true;
         self.alt_return = if save {
-            Some((self.primary.cursor, self.pen))
+            Some((
+                SavedState {
+                    cursor: self.primary.cursor,
+                    pen: self.pen,
+                    origin: self.modes.origin,
+                    autowrap: self.modes.autowrap,
+                    charsets: self.charsets,
+                    active_charset: self.active_charset,
+                },
+                self.primary.top,
+                self.primary.bottom,
+            ))
         } else {
             None
         };
@@ -1029,14 +1112,32 @@ impl Screen {
         self.alternate = None;
         self.alt_active = false;
         if restore {
-            if let Some((cursor, pen)) = self.alt_return.take() {
-                self.primary.cursor = cursor;
-                self.pen = pen;
+            if let Some((state, top, bottom)) = self.alt_return.take() {
+                self.modes.origin = state.origin;
+                self.modes.autowrap = state.autowrap;
+                self.pen = state.pen;
+                self.charsets = state.charsets;
+                self.active_charset = state.active_charset;
+                self.primary.cursor = state.cursor;
+                self.primary.cursor.row = self
+                    .primary
+                    .cursor
+                    .row
+                    .min(self.primary.rows.saturating_sub(1));
+                self.primary.cursor.col = self
+                    .primary
+                    .cursor
+                    .col
+                    .min(self.primary.cols.saturating_sub(1));
+                self.primary.cursor.pending_wrap = false;
+                self.primary.top = top.min(self.primary.rows.saturating_sub(1));
+                self.primary.bottom = bottom.min(self.primary.rows.saturating_sub(1));
+                if self.primary.top >= self.primary.bottom {
+                    self.primary.top = 0;
+                    self.primary.bottom = self.primary.rows.saturating_sub(1);
+                }
             }
         }
-        let bottom = self.primary.rows.saturating_sub(1);
-        self.primary.top = 0;
-        self.primary.bottom = bottom;
         self.primary.cursor.pending_wrap = false;
     }
 
@@ -1055,6 +1156,7 @@ impl Screen {
         self.tabs = default_tabs(cols);
         self.last_char = None;
         self.current_link = None;
+        self.last_print = None;
         self.saved = SavedState {
             cursor: Cursor::default(),
             pen: Style::default(),
@@ -1075,18 +1177,26 @@ impl Screen {
         if let Some(alt) = self.alternate.as_mut() {
             resize_buffer(alt, cols, rows);
         }
+        let old_cols = self.tabs.len();
         let mut tabs = vec![false; cols];
         for (i, tab) in self.tabs.iter().enumerate().take(cols) {
             tabs[i] = *tab;
         }
-        for i in (0..cols).step_by(8) {
-            if i > 0 {
+        // Only new columns receive default stops; resizing must not resurrect
+        // stops the user cleared with TBC.
+        for i in (8..cols).step_by(8) {
+            if i >= old_cols {
                 tabs[i] = true;
             }
         }
         self.tabs = tabs;
         self.saved.cursor.row = self.saved.cursor.row.min(rows - 1);
         self.saved.cursor.col = self.saved.cursor.col.min(cols - 1);
+        if let Some((row, col)) = self.last_print {
+            if row >= rows || col >= cols {
+                self.last_print = None;
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1191,7 +1301,7 @@ impl Screen {
             }
             "1" => {}
             "7" => {
-                if let Some(uri) = params.get(2) {
+                if let Some(uri) = params.get(1) {
                     let uri = String::from_utf8_lossy(uri).into_owned();
                     if let Some(path) = parse_file_uri(&uri) {
                         self.cwd = Some(path.clone());
@@ -1210,7 +1320,7 @@ impl Screen {
                         self.current_link = None;
                     } else {
                         let cleaned = sanitize_text(&uri, 2048);
-                        if cleaned.is_empty() {
+                        if cleaned.is_empty() || !safe_hyperlink(&cleaned) {
                             self.current_link = None;
                         } else {
                             self.current_link = Some(Arc::from(cleaned));
@@ -1421,6 +1531,21 @@ fn resize_buffer(buf: &mut Buffer, cols: usize, rows: usize) {
             ));
         }
     }
+    buf.scrollback_bytes = buf
+        .scrollback
+        .iter()
+        .map(|row| row.cells.len().saturating_mul(CELL_BYTES))
+        .sum();
+    while buf.scrollback_bytes > SCROLLBACK_BYTE_LIMIT {
+        if let Some(front) = buf.scrollback.pop_front() {
+            buf.scrollback_bytes = buf
+                .scrollback_bytes
+                .saturating_sub(front.cells.len().saturating_mul(CELL_BYTES));
+        } else {
+            buf.scrollback_bytes = 0;
+            break;
+        }
+    }
     if buf.top >= rows {
         buf.top = 0;
     }
@@ -1467,6 +1592,14 @@ fn parse_extended_color(groups: &[&[u16]], i: usize, group: &[u16]) -> Option<(C
     }
 }
 
+fn safe_hyperlink(uri: &str) -> bool {
+    let lower = uri.to_ascii_lowercase();
+    ["http://", "https://", "mailto:", "file://", "ftp://"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+        || !lower.contains(':')
+}
+
 fn sanitize_text(s: &str, max: usize) -> String {
     s.chars()
         .filter(|c| !c.is_control())
@@ -1487,7 +1620,11 @@ fn parse_file_uri(uri: &str) -> Option<String> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
             if let Ok(v) = u8::from_str_radix(&path[i + 1..i + 3], 16) {
                 out.push(v);
                 i += 3;
@@ -1940,6 +2077,104 @@ mod tests {
     }
 
     #[test]
+    fn c1_controls_never_become_printable_cells() {
+        let mut t = term(10, 2);
+        // UTF-8 encoding of U+009B (C1 CSI), U+009D (OSC).
+        feed(&mut t, "a\u{009b}31mX\u{009d}evil\u{009c}b");
+        for row in 0..2 {
+            for cell in t.screen.primary.row(row) {
+                assert!(!cell.ch.is_control(), "control char in cell: {:?}", cell.ch);
+                if let Some(extra) = &cell.extra {
+                    assert!(!extra.chars().any(|c| c.is_control()));
+                }
+            }
+        }
+        assert!(t.screen.dump().contains('X'));
+    }
+
+    #[test]
+    fn alt_screen_resize_then_exit_does_not_leave_invalid_cursor() {
+        let mut t = term(10, 5);
+        feed(&mut t, "\x1b[5;10H\x1b[?1049h");
+        t.resize(3, 2);
+        feed(&mut t, "\x1b[?1049l");
+        let c = t.screen.active().cursor;
+        assert!(c.row < 2 && c.col < 3);
+        feed(&mut t, "x");
+        assert!(t.screen.active().cursor.row < 2);
+    }
+
+    #[test]
+    fn alt_screen_restores_modes_and_margins() {
+        let mut t = term(10, 5);
+        feed(
+            &mut t,
+            "\x1b[2;4r\x1b[?1049h\x1b[?7l\x1b[?6h\x1b(0\x1b[?1049l",
+        );
+        assert!(t.screen.modes.autowrap);
+        assert!(!t.screen.modes.origin);
+        assert_eq!(t.screen.charsets[0], Charset::Ascii);
+        assert_eq!(t.screen.primary.top, 1);
+        assert_eq!(t.screen.primary.bottom, 3);
+    }
+
+    #[test]
+    fn cuu_cud_respect_cursor_outside_margins() {
+        let mut t = term(10, 5);
+        feed(&mut t, "\x1b[2;4r\x1b[A");
+        assert_eq!(t.screen.active().cursor.row, 0);
+        feed(&mut t, "\x1b[5;1H\x1b[B");
+        assert_eq!(t.screen.active().cursor.row, 4);
+    }
+
+    #[test]
+    fn autowrap_off_at_edge_repairs_old_wide_pair() {
+        let mut t = term(3, 1);
+        feed(&mut t, "a中\x1b[?7l中");
+        assert!(!t.screen.primary.row(0)[1].wide);
+        assert!(!t.screen.primary.row(0)[2].cont);
+    }
+
+    #[test]
+    fn one_column_screen_never_creates_a_wide_lead() {
+        let mut t = term(1, 2);
+        feed(&mut t, "中");
+        assert!(!t.screen.primary.row(0)[0].wide);
+        assert!(!t.screen.primary.row(1)[0].wide);
+        assert!(!t.screen.primary.row(0)[0].cont);
+        assert!(!t.screen.primary.row(1)[0].cont);
+    }
+
+    #[test]
+    fn osc7_uses_the_standard_parameter_and_decodes_safely() {
+        let mut t = term(10, 2);
+        feed(&mut t, "\x1b]7;file:///tmp/a%E4%B8%AD\x07");
+        assert_eq!(t.take_events(), vec![Event::Cwd("/tmp/a中".into())]);
+        // A percent followed by a multibyte character must not slice a UTF-8
+        // boundary or panic.
+        feed(&mut t, "\x1b]7;file:///a%😀\x07");
+    }
+
+    #[test]
+    fn resize_does_not_restore_cleared_tab_stops() {
+        let mut t = term(20, 2);
+        feed(&mut t, "\x1b[1;9H\x1b[0g\x1b[1;1H");
+        t.resize(21, 2);
+        feed(&mut t, "\t");
+        assert_eq!(t.screen.active().cursor.col, 16);
+    }
+
+    #[test]
+    fn combining_after_newline_does_not_decorate_previous_row() {
+        let mut t = term(5, 2);
+        feed(&mut t, "AB\r\n");
+        feed(&mut t, "\u{0301}");
+        for cell in t.screen.primary.row(0) {
+            assert!(cell.extra.is_none());
+        }
+    }
+
+    #[test]
     fn resize_keeps_content_and_cursor_valid() {
         let mut t = term(10, 4);
         feed(&mut t, "hello\r\nworld");
@@ -2008,6 +2243,18 @@ mod tests {
         feed(&mut t, "\x1b]2;hello; world\x07");
         let events = t.take_events();
         assert_eq!(events[0], Event::Title("hello; world".into()));
+    }
+
+    #[test]
+    fn dangerous_hyperlink_schemes_are_dropped() {
+        let mut t = term(10, 2);
+        feed(&mut t, "\x1b]8;;javascript:alert(1)\x1b\\x");
+        assert!(t.screen.primary.row(0)[0].link.is_none());
+        feed(&mut t, "\x1b]8;;https://example.com\x1b\\y");
+        assert_eq!(
+            t.screen.primary.row(0)[1].link.as_deref(),
+            Some("https://example.com")
+        );
     }
 
     #[test]

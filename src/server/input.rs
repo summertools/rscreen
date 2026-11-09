@@ -96,6 +96,11 @@ pub enum InputEvent {
     PrefixPending,
     Mouse(MouseEvent),
     Paste(Vec<u8>),
+    PasteTooLarge,
+    /// A complete escape/chord sequence (modified arrow, Alt+key, terminal
+    /// response...). It is forwarded to applications verbatim, but overlays and
+    /// copy mode ignore it instead of misreading the leading ESC as a cancel.
+    RawKey(Vec<u8>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,6 +122,7 @@ pub struct InputParser {
     paste_tail: Vec<u8>,
     paste_discard: bool,
     prefix_utf8_remaining: u8,
+    prefix_utf8_buf: Vec<u8>,
     /// Set when the user pressed the prefix and then Esc alone.
     prefix_esc: bool,
 }
@@ -138,6 +144,7 @@ impl InputParser {
             paste_tail: Vec::new(),
             paste_discard: false,
             prefix_utf8_remaining: 0,
+            prefix_utf8_buf: Vec::new(),
             prefix_esc: false,
         }
     }
@@ -159,10 +166,20 @@ impl InputParser {
 
         for &byte in bytes {
             if self.prefix_utf8_remaining > 0 {
+                self.prefix_utf8_buf.push(byte);
                 self.prefix_utf8_remaining -= 1;
                 if self.prefix_utf8_remaining == 0 {
                     self.prefix_pending = false;
-                    events.push(InputEvent::PrefixCancel);
+                    let decoded = std::str::from_utf8(&self.prefix_utf8_buf)
+                        .ok()
+                        .and_then(|s| s.chars().next());
+                    match decoded {
+                        Some(ch) if !ch.is_control() => {
+                            events.push(InputEvent::PrefixKey(Key::Char(ch)));
+                        }
+                        _ => events.push(InputEvent::PrefixCancel),
+                    }
+                    self.prefix_utf8_buf.clear();
                 }
                 continue;
             }
@@ -174,21 +191,30 @@ impl InputParser {
                         self.paste_tail.remove(0);
                     }
                     if self.paste_tail == b"\x1b[201~" {
-                        let payload = std::mem::take(&mut self.paste);
                         self.paste_tail.clear();
                         self.paste_discard = false;
                         self.state = State::Ground;
                         self.since = None;
-                        events.push(InputEvent::Paste(payload));
+                        events.push(InputEvent::PasteTooLarge);
                     }
                     continue;
                 }
                 self.paste.push(byte);
                 if self.paste.len() > LIMIT {
+                    // Do not deliver a silently truncated paste. Keep only a
+                    // short tail so the closing marker can still be found.
                     self.paste_discard = true;
-                    let start = self.paste.len() - 6;
+                    let start = self.paste.len().saturating_sub(6);
                     self.paste_tail = self.paste[start..].to_vec();
-                    self.paste.truncate(LIMIT);
+                    self.paste.clear();
+                    if self.paste_tail == b"\x1b[201~" {
+                        self.paste_tail.clear();
+                        self.paste_discard = false;
+                        self.state = State::Ground;
+                        self.since = None;
+                        events.push(InputEvent::PasteTooLarge);
+                    }
+                    continue;
                 }
                 if self.paste.ends_with(b"\x1b[201~") {
                     let len = self.paste.len() - 6;
@@ -256,11 +282,18 @@ impl InputParser {
                                 continue;
                             }
                             _ => {
-                                self.prefix_pending = false;
-                                self.prefix_utf8_remaining = utf8_continuations(byte);
-                                events.push(InputEvent::PrefixCancel);
-                                if self.prefix_utf8_remaining == 0 {
-                                    // Already complete (invalid lead byte).
+                                let need = utf8_continuations(byte);
+                                if need == 0 {
+                                    self.prefix_pending = false;
+                                    events.push(InputEvent::PrefixCancel);
+                                } else {
+                                    // Decode the complete character; pressing
+                                    // prefix + é should either match a bound
+                                    // unicode key or report an unknown key,
+                                    // never silently eat it.
+                                    self.prefix_utf8_remaining = need;
+                                    self.prefix_utf8_buf.clear();
+                                    self.prefix_utf8_buf.push(byte);
                                 }
                                 continue;
                             }
@@ -306,7 +339,7 @@ impl InputParser {
                                 events.push(InputEvent::PrefixKey(Key::Char(byte as char)));
                             } else {
                                 flush(&mut data, &mut events);
-                                events.push(InputEvent::Data(std::mem::take(&mut self.seq)));
+                                events.push(InputEvent::RawKey(std::mem::take(&mut self.seq)));
                             }
                             self.seq.clear();
                         }
@@ -348,7 +381,7 @@ impl InputParser {
                             events.push(InputEvent::PrefixCancel);
                         } else {
                             flush(&mut data, &mut events);
-                            events.push(InputEvent::Data(seq));
+                            events.push(InputEvent::RawKey(seq));
                         }
                     }
                 }
@@ -411,7 +444,7 @@ impl InputParser {
         } else {
             let mut raw = Vec::with_capacity(seq.len());
             raw.extend_from_slice(seq);
-            events.push(InputEvent::Data(raw));
+            events.push(InputEvent::RawKey(raw));
         }
     }
 
@@ -445,7 +478,7 @@ impl InputParser {
             None => {
                 let mut raw = Vec::new();
                 raw.extend_from_slice(&self.seq);
-                events.push(InputEvent::Data(raw));
+                events.push(InputEvent::RawKey(raw));
             }
         }
         self.seq.clear();
@@ -483,7 +516,7 @@ impl InputParser {
             self.since = None;
             self.prefix_pending = false;
             self.prefix_esc = false;
-            events.push(InputEvent::Data(seq));
+            events.push(InputEvent::RawKey(seq));
         }
         events
     }
@@ -498,6 +531,8 @@ impl InputParser {
         self.paste.clear();
         self.paste_tail.clear();
         self.paste_discard = false;
+        self.prefix_utf8_remaining = 0;
+        self.prefix_utf8_buf.clear();
         self.prefix_pending = false;
         self.prefix_esc = false;
         self.since = None;
@@ -787,10 +822,31 @@ mod tests {
     }
 
     #[test]
-    fn modified_arrows_pass_raw() {
+    fn modified_arrows_are_raw_key_events() {
         let mut p = InputParser::new();
         let events = collect(&mut p, b"\x1b[1;2A");
-        assert_eq!(data(&events), b"\x1b[1;2A");
+        assert_eq!(data(&events), b"");
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, InputEvent::RawKey(bytes) if bytes == b"\x1b[1;2A")));
+    }
+
+    #[test]
+    fn alt_key_is_a_raw_key_event() {
+        let mut p = InputParser::new();
+        let events = collect(&mut p, b"\x1bx");
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, InputEvent::RawKey(bytes) if bytes == b"\x1bx")));
+    }
+
+    #[test]
+    fn prefix_accepts_unicode_keys() {
+        let mut p = InputParser::new();
+        let events = collect(&mut p, "\x01é".as_bytes());
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, InputEvent::PrefixKey(Key::Char('é')))));
     }
 
     #[test]

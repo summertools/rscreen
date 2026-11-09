@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 /// Override for tests and unusual setups: `RSCREEN_RUNTIME_DIR`.
 pub fn runtime_dir() -> PathBuf {
@@ -39,17 +39,43 @@ pub fn config_path() -> PathBuf {
                 .join("config.toml");
         }
     }
-    PathBuf::from("/tmp/rscreen-config.toml")
+    // Never fall back to a predictable file in a world-writable directory:
+    // it could be created by another local user and inject shell commands.
+    runtime_dir().join("config.toml")
 }
 
 pub fn ensure_runtime_dir() -> Result<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
     let dir = runtime_dir();
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("creating runtime directory {}", dir.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+
+    // Refuse to use a shared or attacker-controlled directory. Session
+    // sockets carry screen contents and clipboard traffic, so they must live
+    // in a private per-user directory.
+    let metadata = std::fs::symlink_metadata(&dir)
+        .with_context(|| format!("inspecting runtime directory {}", dir.display()))?;
+    if !metadata.file_type().is_dir() {
+        bail!("runtime path {} is not a directory", dir.display());
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        bail!(
+            "runtime directory {} is not owned by the current user",
+            dir.display()
+        );
+    }
+    if metadata.mode() & 0o077 != 0 {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("making runtime directory {} private", dir.display()))?;
+        let metadata = std::fs::metadata(&dir)?;
+        if metadata.mode() & 0o077 != 0 {
+            bail!(
+                "runtime directory {} is not private (mode {:o}); set RSCREEN_RUNTIME_DIR to a private directory",
+                dir.display(),
+                metadata.mode() & 0o777
+            );
+        }
     }
     Ok(dir)
 }

@@ -13,7 +13,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use base64::Engine;
 use nix::poll::{poll, PollFd, PollFlags};
-use serde::Serialize;
 
 use crate::config::{prefix_label, BellMode, Config, Theme};
 use crate::layout::{
@@ -36,8 +35,10 @@ use crate::term::{attrs, Cell, Style};
 use crate::util;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const MAX_COLS: u16 = 1000;
-const MAX_ROWS: u16 = 500;
+const MAX_COLS: u16 = 600;
+const MAX_ROWS: u16 = 300;
+const MAX_CLIENTS: usize = 8;
+const READ_BUDGET: usize = 256 * 1024;
 
 fn clamp_size(cols: u16, rows: u16) -> (u16, u16) {
     (cols.clamp(1, MAX_COLS), rows.clamp(1, MAX_ROWS))
@@ -94,7 +95,7 @@ impl Action {
             Action::SplitRight => "Split pane right",
             Action::SplitDown => "Split pane down",
             Action::NextPane => "Focus next pane",
-            Action::LastPane => "Focus previous pane",
+            Action::LastPane => "Focus last active pane",
             Action::FocusLeft => "Focus pane left",
             Action::FocusRight => "Focus pane right",
             Action::FocusUp => "Focus pane up",
@@ -202,6 +203,10 @@ impl KeyMap {
                 continue;
             }
             match input::parse_key_name(value) {
+                Some(Key::Esc) => warnings.push(format!(
+                    "{}: Escape cannot be a prefix binding (it cancels the prefix)",
+                    name
+                )),
                 Some(key) => {
                     bindings.retain(|(_, a)| *a != action);
                     bindings.push((key, action));
@@ -302,6 +307,7 @@ struct Client {
     caps: Caps,
     hello: bool,
     connected_at: Instant,
+    partial_since: Option<Instant>,
     last_frame: Option<crate::render::Canvas>,
     last_cursor: Option<CursorView>,
     input: InputParser,
@@ -309,7 +315,7 @@ struct Client {
 }
 
 impl Client {
-    fn queue_msg<T: Serialize>(&mut self, msg: &T) -> bool {
+    fn queue_msg<T: crate::protocol::WireMessage>(&mut self, msg: &T) -> bool {
         match crate::protocol::encode(msg) {
             Ok(bytes) => self.queue_bytes(&bytes),
             Err(_) => false,
@@ -317,7 +323,7 @@ impl Client {
     }
 
     fn queue_bytes(&mut self, bytes: &[u8]) -> bool {
-        if self.out.len().saturating_sub(self.out_off) + bytes.len() > 64 * 1024 * 1024 {
+        if self.out.len().saturating_sub(self.out_off) + bytes.len() > 16 * 1024 * 1024 {
             return false;
         }
         self.out.extend_from_slice(bytes);
@@ -403,6 +409,7 @@ pub struct Session {
     version: String,
     dying: Vec<Pane>,
     drag: Option<DragState>,
+    mouse_grab: Option<(PaneId, Rect)>,
     signals: Arc<AtomicBool>,
 }
 
@@ -469,6 +476,7 @@ pub fn run_server(options: ServerOptions) -> Result<()> {
         version: format!("rscreen {}", VERSION),
         dying: Vec::new(),
         drag: None,
+        mouse_grab: None,
         signals: terminate,
     };
     session.prefix = session.config.prefix;
@@ -664,6 +672,7 @@ impl Session {
         }
         let old = self.focused();
         self.drag = None;
+        self.mouse_grab = None;
         self.active_window = index;
         self.clear_window_bell(index);
         self.resize_window(index);
@@ -739,9 +748,15 @@ impl Session {
         if self.windows.is_empty() {
             return;
         }
-        self.ui.copy = None;
         let area = self.content_area(self.size.0, self.size.1);
         let window_index = self.active_window;
+        if self.windows[window_index].zoom {
+            // Splitting a zoomed pane is confusing if the fit check uses the
+            // hidden layout. Unzoom first so what the user sees is what the
+            // layout solver measures.
+            self.windows[window_index].zoom = false;
+            self.resize_window(window_index);
+        }
         let solved = self.windows[window_index]
             .layout
             .solve(area, self.windows[window_index].pane_count() > 1);
@@ -785,12 +800,12 @@ impl Session {
         match self.spawn_pane(cwd, cols, rows, "shell") {
             Ok(pane) => {
                 let new_id = pane.id;
-                self.windows[window_index].zoom = false;
                 if let Err(err) = self.windows[window_index].split(pane, dir) {
                     self.ui.toast_error(&self.theme, err);
                     self.dirty = true;
                     return;
                 }
+                self.ui.copy = None;
                 self.resize_window(window_index);
                 self.notify_focus_change(Some(target), Some(new_id));
                 self.ui.toast(&self.theme, "Pane created");
@@ -824,6 +839,13 @@ impl Session {
             .unwrap_or(false)
         {
             self.drag = None;
+        }
+        if self
+            .mouse_grab
+            .map(|(id, _)| id == pane_id)
+            .unwrap_or(false)
+        {
+            self.mouse_grab = None;
         }
         let mut removed = self.windows[index].remove_pane(pane_id);
         if let Some(pane) = removed.as_mut() {
@@ -914,16 +936,19 @@ impl Session {
     }
 
     fn toggle_zoom(&mut self) {
-        self.ui.copy = None;
-        let Some(window) = self.active_window_mut() else {
+        let Some(count) = self.active_window().map(|w| w.pane_count()) else {
             return;
         };
-        if window.pane_count() <= 1 {
+        if count <= 1 {
             self.ui
                 .toast_info(&self.theme, "Only one pane in this window");
             self.dirty = true;
             return;
         }
+        self.ui.copy = None;
+        let Some(window) = self.active_window_mut() else {
+            return;
+        };
         window.zoom = !window.zoom;
         let zoomed = window.zoom;
         let index = self.active_window;
@@ -1003,13 +1028,17 @@ impl Session {
     }
 
     fn focus_next_pane(&mut self, forward: bool) {
+        if self
+            .active_window()
+            .map(|w| w.pane_count() <= 1)
+            .unwrap_or(true)
+        {
+            return;
+        }
         self.ui.copy = None;
         let Some(window) = self.active_window_mut() else {
             return;
         };
-        if window.pane_count() <= 1 {
-            return;
-        }
         let old = window.active;
         window.focus_next(forward);
         let new = window.active;
@@ -1018,6 +1047,13 @@ impl Session {
     }
 
     fn focus_previous_pane(&mut self) {
+        if self
+            .active_window()
+            .map(|w| w.pane_count() <= 1)
+            .unwrap_or(true)
+        {
+            return;
+        }
         self.ui.copy = None;
         let (old, new) = {
             let Some(window) = self.active_window_mut() else {
@@ -1032,6 +1068,7 @@ impl Session {
     }
 
     fn open_palette(&mut self, kind: PaletteKind) {
+        self.mouse_grab = None;
         let items = self.build_palette_items(kind);
         let mut palette = PaletteState::new(kind, items);
         if kind == PaletteKind::Windows {
@@ -1076,6 +1113,7 @@ impl Session {
                 Action::Help,
                 Action::ToggleStatus,
                 Action::Detach,
+                Action::DetachAll,
                 Action::KillWindow,
                 Action::KillSession,
             ];
@@ -1093,6 +1131,7 @@ impl Session {
     }
 
     fn open_help(&mut self) {
+        self.mouse_grab = None;
         self.ui.overlay = Overlay::Help(self.build_help());
         self.dirty = true;
     }
@@ -1105,8 +1144,14 @@ impl Session {
                 title: "SESSION",
                 rows: vec![
                     (key(Action::Detach), "Detach from this session".into()),
+                    (key(Action::DetachAll), "Detach every client".into()),
                     (key(Action::Palette), "Command palette".into()),
                     (key(Action::Help), "This help screen".into()),
+                    (
+                        key(Action::ToggleStatus),
+                        "Toggle one/two-row status".into(),
+                    ),
+                    (format!("{p} {p}"), "Send the prefix key literally".into()),
                     (key(Action::KillSession), "Kill the whole session".into()),
                 ],
             },
@@ -1131,6 +1176,7 @@ impl Session {
                     (key(Action::SplitRight), "Split right".into()),
                     (key(Action::SplitDown), "Split down".into()),
                     (key(Action::NextPane), "Focus the next pane".into()),
+                    (key(Action::LastPane), "Focus the last active pane".into()),
                     (
                         format!(
                             "{} {}/{}/{}/{}",
@@ -1186,13 +1232,21 @@ impl Session {
             HelpSection {
                 title: "COPY MODE",
                 rows: vec![
-                    (format!("{} [", p), "Enter copy mode".into()),
+                    (key(Action::CopyMode), "Enter copy mode".into()),
                     ("hjkl / arrows".into(), "Move the cursor".into()),
+                    (
+                        "w / b · 0 / $ · g / G".into(),
+                        "Words, line ends, history ends".into(),
+                    ),
+                    (
+                        "PgUp / PgDn · ^U / ^D".into(),
+                        "Page through history".into(),
+                    ),
                     ("space / v".into(), "Start or clear a selection".into()),
                     ("/ ?".into(), "Search forward / backward".into()),
                     ("n / N".into(), "Next / previous match".into()),
                     ("y / enter".into(), "Copy and leave copy mode".into()),
-                    (format!("{} ]", p), "Paste the copy buffer".into()),
+                    (key(Action::PasteBuffer), "Paste the copy buffer".into()),
                     ("q / esc".into(), "Leave copy mode".into()),
                 ],
             },
@@ -1201,7 +1255,10 @@ impl Session {
                 rows: vec![
                     ("wheel".into(), "Scroll the focused pane".into()),
                     ("drag".into(), "Select and copy text".into()),
-                    ("click".into(), "Focus a pane or window tab".into()),
+                    (
+                        "click".into(),
+                        "Focus a pane/tab; position in copy mode".into(),
+                    ),
                 ],
             },
         ];
@@ -1272,10 +1329,42 @@ fn palette_action_for(action: Action) -> PaletteAction {
         Action::Help => PaletteAction::Help,
         Action::ToggleStatus => PaletteAction::ToggleStatusRows,
         Action::Detach => PaletteAction::Detach,
+        Action::DetachAll => PaletteAction::DetachAll,
         Action::KillWindow => PaletteAction::KillWindow,
         Action::KillSession => PaletteAction::KillSession,
         _ => PaletteAction::NewWindow,
     }
+}
+
+#[cfg(target_os = "linux")]
+fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+    use std::mem;
+    let mut cred: libc::ucred = unsafe { mem::zeroed() };
+    let mut len = mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(cred.uid)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn peer_uid(_stream: &UnixStream) -> io::Result<u32> {
+    Ok(unsafe { libc::geteuid() })
+}
+
+fn reject_client(mut stream: UnixStream, message: &str) {
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
+    let _ = crate::protocol::write_msg(&mut stream, &ServerMsg::Error(message.to_string()));
 }
 
 fn clock_string() -> String {
@@ -1291,6 +1380,24 @@ fn log(message: &str) {
 // ---------------------------------------------------------------------------
 
 impl Session {
+    /// Feed raw client bytes back through the input parser. Used both for
+    /// normal socket input and for the suffix of a chunk whose modal closed
+    /// halfway through.
+    fn feed_client_bytes(&mut self, id: u64, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let allow_prefix = !matches!(self.ui.overlay, Overlay::Palette(_) | Overlay::Prompt(_));
+        let Some(client) = self.clients.get_mut(&id) else {
+            return;
+        };
+        if !client.hello {
+            return;
+        }
+        let events = client.input.feed_with(data, self.prefix, allow_prefix);
+        self.handle_input_events(id, events);
+    }
+
     fn handle_client_message(&mut self, id: u64, msg: ClientMsg) {
         match msg {
             ClientMsg::Hello {
@@ -1343,20 +1450,15 @@ impl Session {
                 self.dirty = true;
             }
             ClientMsg::Input(data) => {
+                self.feed_client_bytes(id, &data);
+            }
+            ClientMsg::Resize { cols, rows } => {
                 let Some(client) = self.clients.get_mut(&id) else {
                     return;
                 };
                 if !client.hello {
                     return;
                 }
-                let allow_prefix = !matches!(self.ui.overlay, Overlay::Prompt(_));
-                let events = client.input.feed_with(&data, self.prefix, allow_prefix);
-                self.handle_input_events(id, events);
-            }
-            ClientMsg::Resize { cols, rows } => {
-                let Some(client) = self.clients.get_mut(&id) else {
-                    return;
-                };
                 client.size = clamp_size(cols, rows);
                 let resize_session = self.driver == Some(id) || self.driver.is_none();
                 if resize_session {
@@ -1439,8 +1541,11 @@ impl Session {
         if self.clients.is_empty() {
             self.driver = None;
             self.notify_focus_change(old_focus, None);
+            self.ui.overlay = Overlay::None;
             self.ui.copy = None;
+            self.ui.toast = None;
             self.drag = None;
+            self.mouse_grab = None;
         } else if self
             .driver
             .map(|d| !self.clients.contains_key(&d))
@@ -1469,7 +1574,9 @@ impl Session {
             self.notify_focus_change(focus, None);
             self.ui.overlay = Overlay::None;
             self.ui.copy = None;
+            self.ui.toast = None;
             self.drag = None;
+            self.mouse_grab = None;
         }
         self.dirty = true;
     }
@@ -1511,15 +1618,72 @@ impl Session {
     }
 
     fn cleanup(&mut self) {
+        // Stop accepting new attaches immediately.
+        let _ = std::fs::remove_file(&self.socket_path);
+
+        // Give applications a short chance to save state on SIGHUP/SIGTERM,
+        // then escalate to SIGKILL.
         for window in &mut self.windows {
-            for (_, mut pane) in window.panes.drain() {
+            for pane in window.panes.values_mut() {
+                pane.terminate();
+            }
+        }
+        for pane in &mut self.dying {
+            pane.terminate();
+        }
+
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let mut alive = false;
+            for window in &mut self.windows {
+                for pane in window.panes.values_mut() {
+                    if pane.try_wait().is_none() {
+                        alive = true;
+                    }
+                }
+            }
+            for pane in &mut self.dying {
+                if pane.try_wait().is_none() {
+                    alive = true;
+                }
+            }
+            if !alive || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        for window in &mut self.windows {
+            for pane in window.panes.values_mut() {
                 pane.force_kill();
             }
         }
-        for mut pane in self.dying.drain(..) {
+        for pane in &mut self.dying {
             pane.force_kill();
         }
-        let _ = std::fs::remove_file(&self.socket_path);
+        // A short reap pass avoids leaving zombies during the exit path.
+        let reap_deadline = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < reap_deadline {
+            let mut alive = false;
+            for window in &mut self.windows {
+                for pane in window.panes.values_mut() {
+                    if pane.try_wait().is_none() {
+                        alive = true;
+                    }
+                }
+            }
+            for pane in &mut self.dying {
+                if pane.try_wait().is_none() {
+                    alive = true;
+                }
+            }
+            if !alive {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.windows.clear();
+        self.dying.clear();
         log(&format!("session {:?} stopped", self.name));
     }
 }
@@ -1578,31 +1742,39 @@ impl Session {
                 InputEvent::Paste(data) => {
                     self.handle_paste(client_id, data);
                 }
+                InputEvent::PasteTooLarge => {
+                    self.ui.toast_error(
+                        &self.theme,
+                        "Paste is too large (limit 32 MiB); nothing was pasted",
+                    );
+                    self.dirty = true;
+                }
+                InputEvent::RawKey(data) => {
+                    self.handle_raw_key_event(client_id, &data);
+                }
             }
         }
     }
 
     fn handle_prefix_key(&mut self, client_id: u64, key: Key) {
+        // Explicit key bindings win, including bindings to digits.
+        if let Some(action) = self.keymap.lookup(key) {
+            self.execute_action(client_id, action);
+            return;
+        }
         if let Key::Char(c) = key {
-            if c.is_ascii_digit() {
-                if let Some(n) = c.to_digit(10) {
-                    self.ui.overlay = Overlay::None;
-                    let number = if n == 0 { 10 } else { n as usize };
-                    self.select_window_number(number);
-                    return;
-                }
+            if let Some(n) = c.to_digit(10) {
+                self.ui.overlay = Overlay::None;
+                let number = if n == 0 { 10 } else { n as usize };
+                self.select_window_number(number);
+                return;
             }
         }
-        match self.keymap.lookup(key) {
-            Some(action) => self.execute_action(client_id, action),
-            None => {
-                self.ui.toast_error(
-                    &self.theme,
-                    format!("Unknown prefix key: {}", KeyMap::short_label(key)),
-                );
-                self.dirty = true;
-            }
-        }
+        self.ui.toast_error(
+            &self.theme,
+            format!("Unknown prefix key: {}", KeyMap::short_label(key)),
+        );
+        self.dirty = true;
     }
 
     fn handle_key_event(&mut self, client_id: u64, key: Key) {
@@ -1636,7 +1808,20 @@ impl Session {
         }
     }
 
+    fn handle_raw_key_event(&mut self, client_id: u64, bytes: &[u8]) {
+        // Modified arrows, Alt+key and terminal responses must not be mistaken
+        // for Escape by overlays or replayed as copy-mode commands.
+        if self.ui.overlay_open() || self.ui.copy.is_some() {
+            return;
+        }
+        self.set_driver(client_id);
+        if let Some(pane) = self.focused_pane_mut() {
+            pane.write_input(bytes);
+        }
+    }
+
     fn handle_paste(&mut self, client_id: u64, data: Vec<u8>) {
+        let data = sanitize_paste(&data);
         if self.ui.overlay_open() {
             self.handle_overlay_paste(&data);
             return;
@@ -1709,20 +1894,19 @@ impl Session {
                 Key::Esc | Key::Char('q') => close = true,
                 Key::Down | Key::Char('j') => help.scroll += 1,
                 Key::Up | Key::Char('k') => help.scroll = help.scroll.saturating_sub(1),
-                Key::PageDown => {
-                    help.scroll = (help.scroll + 8).min(help.line_count().saturating_sub(1))
-                }
+                Key::PageDown => help.scroll = (help.scroll + 8).min(help.max_scroll()),
                 Key::PageUp => help.scroll = help.scroll.saturating_sub(8),
                 Key::Home | Key::Char('g') => help.scroll = 0,
-                Key::End | Key::Char('G') => help.scroll = help.line_count().saturating_sub(1),
+                Key::End | Key::Char('G') => help.scroll = help.max_scroll(),
                 _ => {}
             },
             Overlay::Confirm(confirm) => match key {
-                Key::Char('y') | Key::Char('Y') | Key::Enter => {
+                Key::Char('y') | Key::Char('Y') => {
                     deferred_confirm = Some(confirm.action.clone());
                     close = true;
                 }
-                Key::Char('n') | Key::Char('N') | Key::Esc => close = true,
+                // Enter must not confirm a destructive action by accident.
+                Key::Char('n') | Key::Char('N') | Key::Enter | Key::Esc => close = true,
                 _ => {}
             },
             Overlay::Prompt(prompt) => match key {
@@ -1761,34 +1945,63 @@ impl Session {
     }
 
     fn handle_overlay_data(&mut self, client_id: u64, data: &[u8]) {
+        let text_entry = matches!(self.ui.overlay, Overlay::Palette(_) | Overlay::Prompt(_));
         let mut text: Vec<u8> = Vec::new();
-        for &byte in data {
+        let mut i = 0;
+        while i < data.len() {
+            let byte = data[i];
             if byte < 0x20 || byte == 0x7f {
-                self.flush_overlay_text(&text, client_id);
-                text.clear();
-                match byte {
-                    0x1b | 0x03 => self.handle_overlay_key(client_id, Key::Esc),
-                    0x0d | 0x0a => self.handle_overlay_key(client_id, Key::Enter),
-                    0x09 => self.handle_overlay_key(client_id, Key::Tab),
-                    0x7f | 0x08 => self.handle_overlay_key(client_id, Key::Backspace),
-                    0x15 => self.overlay_line_edit(|line| line.kill_to_start()),
-                    0x17 => self.overlay_line_edit(kill_word_before),
-                    0x01 => self.overlay_line_edit(|line| line.home()),
-                    0x05 => self.overlay_line_edit(|line| line.end()),
-                    0x0b => self.overlay_line_edit(|line| line.kill_to_end()),
-                    0x04 => {
-                        if let Overlay::Help(help) = &mut self.ui.overlay {
-                            help.scroll += 6;
-                            self.dirty = true;
-                        }
+                if !text.is_empty() {
+                    self.flush_overlay_text(&text, client_id);
+                    text.clear();
+                    if matches!(self.ui.overlay, Overlay::None) {
+                        self.feed_client_bytes(client_id, &data[i..]);
+                        return;
                     }
-                    _ => {}
                 }
-            } else {
+                self.handle_overlay_control(client_id, byte);
+                i += 1;
+                if matches!(self.ui.overlay, Overlay::None) {
+                    self.feed_client_bytes(client_id, &data[i..]);
+                    return;
+                }
+            } else if text_entry {
                 text.push(byte);
+                i += 1;
+            } else {
+                // Help / confirmation treat printable characters as commands.
+                self.handle_overlay_key(client_id, Key::Char(byte as char));
+                i += 1;
+                if matches!(self.ui.overlay, Overlay::None) {
+                    self.feed_client_bytes(client_id, &data[i..]);
+                    return;
+                }
             }
         }
-        self.flush_overlay_text(&text, client_id);
+        if !text.is_empty() {
+            self.flush_overlay_text(&text, client_id);
+        }
+    }
+
+    fn handle_overlay_control(&mut self, client_id: u64, byte: u8) {
+        match byte {
+            0x1b | 0x03 => self.handle_overlay_key(client_id, Key::Esc),
+            0x0d | 0x0a => self.handle_overlay_key(client_id, Key::Enter),
+            0x09 => self.handle_overlay_key(client_id, Key::Tab),
+            0x7f | 0x08 => self.handle_overlay_key(client_id, Key::Backspace),
+            0x15 => self.overlay_line_edit(|line| line.kill_to_start()),
+            0x17 => self.overlay_line_edit(kill_word_before),
+            0x01 => self.overlay_line_edit(|line| line.home()),
+            0x05 => self.overlay_line_edit(|line| line.end()),
+            0x0b => self.overlay_line_edit(|line| line.kill_to_end()),
+            0x04 => {
+                if let Overlay::Help(help) = &mut self.ui.overlay {
+                    help.scroll = (help.scroll + 6).min(help.max_scroll());
+                    self.dirty = true;
+                }
+            }
+            _ => {}
+        }
     }
 
     fn flush_overlay_text(&mut self, bytes: &[u8], client_id: u64) {
@@ -1839,7 +2052,8 @@ impl Session {
     }
 
     fn handle_overlay_paste(&mut self, data: &[u8]) {
-        let text = paste_text(data);
+        let limit = data.len().min(256 * 1024);
+        let text = paste_text(&data[..limit]);
         if text.is_empty() {
             return;
         }
@@ -1889,6 +2103,7 @@ impl Session {
     }
 
     fn execute_palette_action(&mut self, client_id: u64, action: PaletteAction) {
+        self.mouse_grab = None;
         match action {
             PaletteAction::SelectWindow(id) => self.select_window_id(id),
             PaletteAction::NewWindow => self.create_window(),
@@ -1907,6 +2122,7 @@ impl Session {
             PaletteAction::PasteBuffer => self.paste_buffer(),
             PaletteAction::Help => self.open_help(),
             PaletteAction::Detach => self.detach_client(client_id, false),
+            PaletteAction::DetachAll => self.detach_client(client_id, true),
             PaletteAction::KillSession => self.request_kill_session(),
             PaletteAction::ToggleStatusRows => self.toggle_status_rows(),
             PaletteAction::SendPrefix => {
@@ -1922,6 +2138,7 @@ impl Session {
         // Prefix commands are explicit; close any modal that would otherwise
         // show stale state.
         self.ui.overlay = Overlay::None;
+        self.mouse_grab = None;
         match action {
             Action::NewWindow => self.create_window(),
             Action::NextWindow => self.next_window(true),
@@ -2115,21 +2332,25 @@ impl Session {
             return;
         };
         let bracketed = pane.bracketed_paste();
+        let text = sanitize_paste(text.as_bytes());
         let mut payload = Vec::with_capacity(text.len() + 12);
         if bracketed {
             payload.extend_from_slice(b"\x1b[200~");
         }
-        payload.extend_from_slice(text.as_bytes());
+        payload.extend_from_slice(&text);
         if bracketed {
             payload.extend_from_slice(b"\x1b[201~");
         }
-        if let Some(pane) = self.focused_pane_mut() {
-            if !pane.write_input(&payload) {
-                self.ui
-                    .toast_error(&self.theme, "Buffer is too large for this pane");
-            }
+        let written = self
+            .focused_pane_mut()
+            .map(|pane| pane.write_input(&payload))
+            .unwrap_or(false);
+        if written {
+            self.ui.toast(&self.theme, "Pasted buffer");
+        } else {
+            self.ui
+                .toast_error(&self.theme, "Buffer is too large for this pane");
         }
-        self.ui.toast(&self.theme, "Pasted buffer");
         self.dirty = true;
     }
 
@@ -2240,36 +2461,61 @@ impl Session {
 
     fn finish_copy(&mut self, text: String) {
         let lines = text.lines().count().max(1);
-        self.set_clipboard(text.clone());
-        self.ui.toast(
-            &self.theme,
-            format!("Copied {} line{}", lines, if lines == 1 { "" } else { "s" }),
-        );
+        let synced = self.set_clipboard(text);
+        let label = format!("Copied {} line{}", lines, if lines == 1 { "" } else { "s" });
+        if synced {
+            self.ui.toast(&self.theme, label);
+        } else {
+            self.ui.toast_info(
+                &self.theme,
+                format!("{} · system clipboard sync skipped (too large)", label),
+            );
+        }
         self.dirty = true;
     }
 
-    fn set_clipboard(&mut self, text: String) {
+    /// Returns whether the system clipboard could be updated. A failure does
+    /// not lose the internal copy buffer.
+    fn set_clipboard(&mut self, text: String) -> bool {
         self.clipboard = text.clone();
-        self.broadcast_clipboard(&text);
+        self.broadcast_clipboard(&text)
     }
 
-    fn broadcast_clipboard(&mut self, text: &str) {
+    fn broadcast_clipboard(&mut self, text: &str) -> bool {
         if text.len() > 512 * 1024 {
-            self.ui.toast_info(
-                &self.theme,
-                "Clipboard is too large to sync to the terminal",
-            );
-            return;
+            return false;
         }
         let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
         let mut seq = Vec::with_capacity(encoded.len() + 16);
         seq.extend_from_slice(b"\x1b]52;c;");
         seq.extend_from_slice(encoded.as_bytes());
         seq.extend_from_slice(b"\x1b\\");
+        let mut all_ok = true;
         for client in self.clients.values_mut() {
-            client.queue_msg(&ServerMsg::Raw(seq.clone()));
+            all_ok &= client.queue_msg(&ServerMsg::Raw(seq.clone()));
+        }
+        all_ok
+    }
+}
+
+/// Remove bracketed-paste delimiters from arbitrary clipboard bytes. A pane
+/// can write OSC 52 and then the user can paste that text; without this an
+/// embedded `ESC[201~` would terminate bracketed paste early and the rest
+/// would be interpreted as typed input by the application.
+fn sanitize_paste(data: &[u8]) -> Vec<u8> {
+    const START: &[u8] = b"\x1b[200~";
+    const END: &[u8] = b"\x1b[201~";
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if data[i..].starts_with(START) || data[i..].starts_with(END) {
+            i += 6;
+        } else {
+            out.push(data[i]);
+            i += 1;
         }
     }
+    out
 }
 
 fn kill_word_before(line: &mut InputLine) {
@@ -2323,6 +2569,22 @@ impl Session {
             }
             return;
         }
+        if let Some((pane_id, content)) = self.mouse_grab {
+            if event.motion || !event.pressed {
+                if let Some((_, pane)) = self.find_pane(pane_id) {
+                    let mode = pane.mouse_mode();
+                    let sgr = pane.terminal.screen.modes.mouse_sgr;
+                    let utf8 = pane.terminal.screen.modes.mouse_utf8;
+                    if mode != crate::term::MouseMode::Off && mouse_wanted(mode, event) {
+                        self.forward_mouse(pane_id, event, content, sgr, utf8);
+                    }
+                }
+                if !event.pressed {
+                    self.mouse_grab = None;
+                }
+                return;
+            }
+        }
         if self
             .drag
             .as_ref()
@@ -2342,7 +2604,7 @@ impl Session {
             return;
         };
         if hits.status_y > 0 && event.y >= hits.status_y {
-            if event.pressed && event.y == hits.status_y {
+            if event.pressed && !event.motion && event.y == hits.status_y {
                 for (x, w, window_id) in &hits.tabs {
                     if event.x >= *x && event.x < x.saturating_add(*w) {
                         self.select_window_id(*window_id);
@@ -2360,11 +2622,6 @@ impl Session {
         else {
             return;
         };
-        self.set_driver(client_id);
-        if hit.header.contains(event.x, event.y) {
-            self.focus_pane(hit.window_id, hit.pane_id);
-            return;
-        }
         let app_mouse = self
             .find_pane(hit.pane_id)
             .map(|(_, p)| {
@@ -2375,18 +2632,50 @@ impl Session {
                 )
             })
             .unwrap_or((crate::term::MouseMode::Off, false, false));
-        self.focus_pane(hit.window_id, hit.pane_id);
-        if app_mouse.0 != crate::term::MouseMode::Off {
-            if mouse_wanted(app_mouse.0, event) {
-                self.forward_mouse(hit.pane_id, event, hit.content, app_mouse.1, app_mouse.2);
-            }
-            return;
-        }
+
+        // Wheel acts on the focused pane only and never steals focus.
         if event.is_wheel() {
-            if self.alternate_scroll(hit.pane_id) {
+            if self.focused() != Some(hit.pane_id) {
+                return;
+            }
+            self.set_driver(client_id);
+            if app_mouse.0 != crate::term::MouseMode::Off {
+                if mouse_wanted(app_mouse.0, event) {
+                    self.forward_mouse(hit.pane_id, event, hit.content, app_mouse.1, app_mouse.2);
+                }
+            } else if self.alternate_scroll(hit.pane_id) {
                 self.send_alternate_scroll(hit.pane_id, event);
             } else {
                 self.wheel_scroll(Some(hit.window_id), hit.pane_id, hit.content, event);
+            }
+            return;
+        }
+
+        if hit.header.contains(event.x, event.y) && event.pressed && !event.motion {
+            self.set_driver(client_id);
+            self.focus_pane(hit.window_id, hit.pane_id);
+            return;
+        }
+        if !event.pressed && !event.motion {
+            // A stray release outside a captured drag: nothing to forward.
+            return;
+        }
+        if event.pressed && !event.motion {
+            self.set_driver(client_id);
+            self.focus_pane(hit.window_id, hit.pane_id);
+        }
+        if app_mouse.0 != crate::term::MouseMode::Off {
+            // Hover motion belongs to the app that owns the focused pane. If
+            // the pointer wanders into a neighbour, don't leak coordinates
+            // from another pane into it.
+            if event.motion && self.focused() != Some(hit.pane_id) {
+                return;
+            }
+            if mouse_wanted(app_mouse.0, event) {
+                self.forward_mouse(hit.pane_id, event, hit.content, app_mouse.1, app_mouse.2);
+            }
+            if event.pressed && !event.motion {
+                self.mouse_grab = Some((hit.pane_id, hit.content));
             }
             return;
         }
@@ -2495,34 +2784,26 @@ impl Session {
     }
 
     fn begin_drag(&mut self, client_id: u64, hit: PaneHit, event: MouseEvent) {
-        if let Some(copy) = &self.ui.copy {
-            if copy.pane_id != hit.pane_id {
-                self.ui.copy = None;
-                self.dirty = true;
-            }
-        }
         let Some((_, pane)) = self.find_pane(hit.pane_id) else {
             return;
         };
-        let snapshot = pane.snapshot();
-        let (row, col) = if let Some(copy) = &self.ui.copy {
+        let (snapshot, row, col) = if let Some(copy) = &self.ui.copy {
             if copy.pane_id == hit.pane_id {
-                point_to_copy(copy, hit.content, event)
+                (
+                    copy.snapshot.clone(),
+                    point_to_copy(copy, hit.content, event).0,
+                    point_to_copy(copy, hit.content, event).1,
+                )
             } else {
-                point_to_snapshot(&snapshot, hit.content, event)
+                let snapshot = pane.snapshot();
+                let (row, col) = point_to_snapshot(&snapshot, hit.content, event);
+                (snapshot, row, col)
             }
         } else {
-            point_to_snapshot(&snapshot, hit.content, event)
+            let snapshot = pane.snapshot();
+            let (row, col) = point_to_snapshot(&snapshot, hit.content, event);
+            (snapshot, row, col)
         };
-        if let Some(copy) = self.ui.copy.as_mut() {
-            if copy.pane_id == hit.pane_id {
-                copy.cursor_row = row.min(copy.total_rows().saturating_sub(1));
-                copy.cursor_col = col;
-                copy.anchor = Some((copy.cursor_row, copy.cursor_col));
-                copy.selecting = true;
-                copy.ensure_visible(hit.content.h.max(1));
-            }
-        }
         self.drag = Some(DragState {
             client_id,
             window_id: hit.window_id,
@@ -2530,7 +2811,8 @@ impl Session {
             snapshot,
             anchor_row: row,
             anchor_col: col,
-            moved: self.ui.copy.is_some(),
+            // A click is not a selection. Only motion turns this into one.
+            moved: false,
             content: hit.content,
         });
     }
@@ -2542,21 +2824,35 @@ impl Session {
         if drag.client_id != client_id {
             return;
         }
+        let content = drag.content;
+        let pane_id = drag.pane_id;
+        let anchor_row = drag.anchor_row;
+        let anchor_col = drag.anchor_col;
         if !drag.moved {
             drag.moved = true;
-            let mut copy = CopyState::new(drag.window_id, drag.pane_id, drag.snapshot.clone());
-            copy.cursor_row = drag.anchor_row.min(copy.total_rows().saturating_sub(1));
-            copy.cursor_col = drag.anchor_col;
-            copy.anchor = Some((copy.cursor_row, copy.cursor_col));
-            copy.selecting = true;
-            self.ui.copy = Some(copy);
+            match self.ui.copy.as_mut() {
+                Some(copy) if copy.pane_id == pane_id => {
+                    copy.cursor_row = anchor_row.min(copy.total_rows().saturating_sub(1));
+                    copy.cursor_col = anchor_col;
+                    copy.anchor = Some((copy.cursor_row, copy.cursor_col));
+                    copy.selecting = true;
+                    copy.ensure_visible(content.h.max(1));
+                }
+                _ => {
+                    let mut copy = CopyState::new(drag.window_id, pane_id, drag.snapshot.clone());
+                    copy.cursor_row = anchor_row.min(copy.total_rows().saturating_sub(1));
+                    copy.cursor_col = anchor_col;
+                    copy.anchor = Some((copy.cursor_row, copy.cursor_col));
+                    copy.selecting = true;
+                    self.ui.copy = Some(copy);
+                }
+            }
             self.ui.overlay = Overlay::None;
         }
-        let content = drag.content;
         let Some(copy) = self.ui.copy.as_mut() else {
             return;
         };
-        if copy.pane_id != drag.pane_id {
+        if copy.pane_id != pane_id {
             return;
         }
         let (row, col) = point_to_copy(copy, content, event);
@@ -2584,6 +2880,16 @@ impl Session {
             if !text.is_empty() {
                 self.finish_copy(text);
             }
+        } else if let Some(copy) = self.ui.copy.as_mut() {
+            if copy.pane_id == drag.pane_id {
+                // Click in an existing copy view positions the cursor
+                // without copying a single cell.
+                copy.cursor_row = drag.anchor_row.min(copy.total_rows().saturating_sub(1));
+                copy.cursor_col = drag.anchor_col;
+                copy.anchor = None;
+                copy.selecting = false;
+                copy.ensure_visible(drag.content.h.max(1));
+            }
         }
         self.dirty = true;
     }
@@ -2598,7 +2904,7 @@ fn mouse_wanted(mode: crate::term::MouseMode, event: MouseEvent) -> bool {
         MouseMode::Off => false,
         MouseMode::X10 => event.pressed,
         MouseMode::Normal => !event.motion,
-        MouseMode::Button => !event.motion || event.button & 32 != 0,
+        MouseMode::Button => !event.motion || (event.button & 32 != 0 && event.button & 3 != 3),
         MouseMode::Any => true,
     }
 }
@@ -2827,6 +3133,16 @@ impl Session {
                 self.remove_client(id);
                 continue;
             }
+            if self
+                .clients
+                .get(&id)
+                .and_then(|c| c.partial_since)
+                .map(|since| now.duration_since(since) > Duration::from_secs(10))
+                .unwrap_or(false)
+            {
+                self.remove_client(id);
+                continue;
+            }
             if !events.is_empty() {
                 self.handle_input_events(id, events);
             }
@@ -2898,6 +3214,18 @@ impl Session {
         loop {
             match self.listener.accept() {
                 Ok((stream, _addr)) => {
+                    match peer_uid(&stream) {
+                        Ok(uid) if uid == unsafe { libc::geteuid() } => {}
+                        Ok(_) => continue,
+                        Err(err) => {
+                            log(&format!("peer credential check failed: {}", err));
+                            continue;
+                        }
+                    }
+                    if self.clients.len() >= MAX_CLIENTS {
+                        reject_client(stream, "too many clients");
+                        continue;
+                    }
                     if stream.set_nonblocking(true).is_err() {
                         continue;
                     }
@@ -2912,6 +3240,7 @@ impl Session {
                         caps: Caps::default(),
                         hello: false,
                         connected_at: Instant::now(),
+                        partial_since: None,
                         last_frame: None,
                         last_cursor: None,
                         input: InputParser::new(),
@@ -2938,13 +3267,15 @@ impl Session {
                 return;
             };
             let mut buf = [0u8; 64 * 1024];
-            for _ in 0..16 {
+            let mut read_total = 0usize;
+            for _ in 0..4 {
                 match client.stream.read(&mut buf) {
                     Ok(0) => {
                         eof = true;
                         break;
                     }
                     Ok(n) => {
+                        read_total += n;
                         if let Err(err) = client.reader.push(&buf[..n]) {
                             protocol_error = Some(err.to_string());
                             break;
@@ -2959,7 +3290,7 @@ impl Session {
                                 }
                             }
                         }
-                        if protocol_error.is_some() {
+                        if protocol_error.is_some() || read_total >= READ_BUDGET {
                             break;
                         }
                     }
@@ -2972,6 +3303,18 @@ impl Session {
                     }
                 }
             }
+        }
+        if self
+            .clients
+            .get(&id)
+            .map(|c| c.reader.buffered() > 0)
+            .unwrap_or(false)
+        {
+            if let Some(client) = self.clients.get_mut(&id) {
+                client.partial_since.get_or_insert_with(Instant::now);
+            }
+        } else if let Some(client) = self.clients.get_mut(&id) {
+            client.partial_since = None;
         }
         if let Some(err) = protocol_error {
             self.send_error_and_close(id, err);
@@ -3019,6 +3362,7 @@ impl Session {
                 return;
             };
             let mut buf = [0u8; 64 * 1024];
+            let mut read_total = 0usize;
             loop {
                 match pane.pty.read(&mut buf) {
                     Ok(0) => {
@@ -3028,14 +3372,14 @@ impl Session {
                     }
                     Ok(n) => {
                         saw_data = true;
+                        read_total += n;
                         pane.feed(&buf[..n]);
                         events.extend(pane.take_events());
-                        if n < buf.len() {
-                            // Keep draining until EAGAIN, but avoid an
-                            // unbounded loop for a very chatty process.
-                            if events.len() > 512 {
-                                break;
-                            }
+                        // A process like `yes` can keep the PTY permanently
+                        // readable. Return to poll after a bounded amount so
+                        // signals, input and other panes are serviced.
+                        if read_total >= READ_BUDGET || events.len() > 512 {
+                            break;
                         }
                     }
                     Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
@@ -3086,8 +3430,10 @@ impl Session {
                 }
             }
             Event::Clipboard(text) => {
-                self.set_clipboard(text);
-                self.dirty = true;
+                if self.config.app_clipboard {
+                    let _ = self.set_clipboard(text);
+                    self.dirty = true;
+                }
             }
             Event::Notify(message) => {
                 self.ui.toast_info(&self.theme, message);
@@ -3514,6 +3860,15 @@ impl Session {
                     continue;
                 }
                 canvas.set_pane_cell(content.x + dx, content.y + dy, cell, reverse);
+                if cell.wide && dx + 1 < content.w {
+                    let mut cont = Cell::blank(cell.style);
+                    cont.cont = true;
+                    cont.link = cell.link.clone();
+                    if reverse {
+                        std::mem::swap(&mut cont.style.fg, &mut cont.style.bg);
+                    }
+                    canvas.set(content.x + dx + 1, content.y + dy, cont);
+                }
             }
         }
 
@@ -3588,6 +3943,12 @@ impl Session {
                     cont: false,
                 };
                 canvas.set(content.x + dx, content.y + dy as u16, out);
+                if cell.wide && dx + 1 < content.w {
+                    let mut cont = Cell::blank(style);
+                    cont.cont = true;
+                    cont.link = cell.link.clone();
+                    canvas.set(content.x + dx + 1, content.y + dy as u16, cont);
+                }
             }
         }
         if let Some((col, row)) = copy.cursor_position(content.h) {
@@ -3604,6 +3965,12 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paste_delimiters_are_removed() {
+        let cleaned = sanitize_paste(b"safe\x1b[201~rm -rf /\x1b[200~tail");
+        assert_eq!(cleaned, b"saferm -rf /tail");
+    }
 
     #[test]
     fn default_keymap_has_screen_compatible_aliases() {

@@ -148,6 +148,15 @@ pub fn width(s: &str) -> usize {
     s.width()
 }
 
+/// Remove terminal control characters from text that will be printed outside
+/// the frame renderer (errors, warnings, list output). Newlines and tabs stay
+/// readable; ESC and C1 controls cannot inject terminal escapes.
+pub fn terminal_safe(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c == '\n' || *c == '\t' || !c.is_control())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +179,14 @@ mod tests {
         assert!(fuzzy_score("nw", "New window").is_some());
         assert!(fuzzy_score("xyz", "New window").is_none());
         assert!(fuzzy_score("", "anything").is_some());
+    }
+
+    #[test]
+    fn terminal_safe_strips_escapes() {
+        let s = terminal_safe("bad \x1b]2;title\x07 path\nnext");
+        assert!(!s.contains('\x1b'));
+        assert!(!s.contains('\x07'));
+        assert!(s.contains("next"));
     }
 
     #[test]

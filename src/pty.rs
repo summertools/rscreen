@@ -72,6 +72,10 @@ pub fn spawn(options: SpawnOptions<'_>) -> Result<Pty> {
     let pty = openpty(None, None).context("opening a pseudo terminal")?;
     let master = pty.master;
     let slave = pty.slave;
+    // Both ends must be close-on-exec before forking, otherwise the shell
+    // inherits the PTY master and survives a crashed server.
+    set_cloexec(master.as_raw_fd());
+    set_cloexec(slave.as_raw_fd());
     set_winsize_fd(slave.as_raw_fd(), &winsize);
 
     let mut cmd = Command::new(options.program);
@@ -102,9 +106,14 @@ pub fn spawn(options: SpawnOptions<'_>) -> Result<Pty> {
     cmd.env("RSCREEN", "1");
     cmd.env("RSCREEN_SESSION", options.session);
 
-    let stdin = Stdio::from(slave.try_clone()?);
-    let stdout = Stdio::from(slave.try_clone()?);
-    let stderr = Stdio::from(slave.try_clone()?);
+    let make_stdio = || -> io::Result<Stdio> {
+        let fd = slave.try_clone()?;
+        set_cloexec(fd.as_raw_fd());
+        Ok(Stdio::from(fd))
+    };
+    let stdin = make_stdio()?;
+    let stdout = make_stdio()?;
+    let stderr = make_stdio()?;
     cmd.stdin(stdin);
     cmd.stdout(stdout);
     cmd.stderr(stderr);
@@ -123,6 +132,13 @@ pub fn spawn(options: SpawnOptions<'_>) -> Result<Pty> {
             // so it survives its launching terminal; reset it for the shell.
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
             libc::signal(libc::SIGHUP, libc::SIG_DFL);
+            // Do not leak session sockets, logs or any other server fd into
+            // long-lived applications. CLOSE_RANGE_CLOEXEC keeps the child's
+            // exec-error pipe intact until exec.
+            #[cfg(target_os = "linux")]
+            {
+                libc::close_range(3, u32::MAX, libc::CLOSE_RANGE_CLOEXEC as i32);
+            }
             Ok(())
         });
     }

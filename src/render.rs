@@ -95,7 +95,7 @@ impl Canvas {
         let limit = x.saturating_add(max_w).min(self.cols);
         let mut last: Option<u16> = None;
         for ch in text.chars() {
-            if ch == '\n' || ch == '\r' || ch == '\t' {
+            if ch.is_control() {
                 continue;
             }
             let w = crate::term::char_width(ch);
@@ -188,6 +188,21 @@ impl Canvas {
             .filter(|c| c.visible)
             .map(|c| (c.x.min(self.cols - 1), c.y.min(self.rows - 1)))
     }
+
+    #[cfg(test)]
+    fn row_text_for_test(&self, y: u16) -> String {
+        let mut out = String::new();
+        for x in 0..self.cols {
+            let cell = self.get(x, y);
+            if !cell.cont {
+                out.push(cell.ch);
+                if let Some(extra) = &cell.extra {
+                    out.push_str(extra);
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Draw a rounded panel with a shadow. Returns the inner content rectangle.
@@ -203,7 +218,7 @@ pub fn draw_panel(
     }
     // Soft shadow on the right and bottom.
     let shadow_fill = Cell::blank(Style::default().bg(theme.shadow));
-    if rect.x + rect.w < canvas.cols {
+    if rect.x + rect.w < canvas.cols && rect.y + rect.h + 1 < canvas.rows {
         canvas.fill(rect.x + 1, rect.y + rect.h, rect.w, 1, shadow_fill.clone());
     }
     if rect.y + rect.h < canvas.rows {
@@ -386,7 +401,8 @@ pub fn draw_status(canvas: &mut Canvas, theme: &Theme, view: &StatusView<'_>) ->
     let bg = Style::default().bg(theme.status_bg);
     canvas.fill(0, y, canvas.cols, rows, Cell::blank(bg));
 
-    // Right-hand information is laid out first so the tabs can use the rest.
+    // Right-hand information is laid out first so the left side can reserve
+    // a bounded area for it.
     let mut right = String::new();
     if let Some(pane) = &view.pane_text {
         right.push_str(pane);
@@ -404,43 +420,55 @@ pub fn draw_status(canvas: &mut Canvas, theme: &Theme, view: &StatusView<'_>) ->
         right.push_str(&view.clock);
     }
     let right_style = Style::default().fg(theme.muted).bg(theme.status_bg);
-    let right_w = if text_width(&right) as u16 + 4 < canvas.cols {
-        text_width(&right) as u16
+    let max_right = if canvas.cols >= 30 {
+        (canvas.cols / 2) as usize
     } else {
         0
     };
-    if right_w > 0 {
-        let x = canvas.cols.saturating_sub(right_w + 1);
-        canvas.put_str(x, y, right_w, &right, right_style);
-    }
+    let right = if max_right > 0 {
+        truncate_display(&right, max_right)
+    } else {
+        String::new()
+    };
+    let right_w = text_width(&right) as u16;
+    let content_end = if right_w > 0 {
+        let right_x = canvas.cols.saturating_sub(right_w + 1);
+        canvas.put_str(right_x, y, right_w, &right, right_style);
+        right_x.saturating_sub(1)
+    } else {
+        canvas.cols
+    };
 
-    // Brand + session name.
+    // Brand + session name, clipped in front of the reserved right area.
     let accent = Style::default().fg(theme.accent).bg(theme.status_bg);
     let session_style = Style::default()
         .fg(theme.status_fg)
         .bg(theme.status_bg)
         .bold();
-    let mut x = canvas.put_str(0, y, 3, " ◆ ", accent);
-    let session_max = (canvas.cols / 3).max(6);
-    let session = truncate_display(view.session, session_max.saturating_sub(1) as usize);
-    x = canvas.put_str(x, y, session_max, &session, session_style);
-    x = canvas.put_str(x, y, 2, "  ", bg);
+    let mut x = canvas.put_str(0, y, content_end.min(3), " ◆ ", accent);
+    let session_max = (canvas.cols / 3)
+        .max(6)
+        .min(content_end.saturating_sub(x + 2));
+    if session_max > 1 {
+        let session = truncate_display(view.session, session_max.saturating_sub(1) as usize);
+        x = canvas.put_str(x, y, session_max, &session, session_style);
+        x = canvas.put_str(x, y, content_end.saturating_sub(x).min(2), "  ", bg);
+    }
 
-    // Optional mode badge (COPY / PREFIX).
+    // Optional mode badge (COPY / ZOOM).
     if let Some((label, fg, badge_bg)) = &view.badge {
         let badge_style = Style::default().fg(*fg).bg(*badge_bg).bold();
         let label = format!(" {} ", label);
         let w = text_width(&label) as u16;
-        x = canvas.put_str(x, y, w, &label, badge_style);
-        x = canvas.put_str(x, y, 1, " ", bg);
+        if x + w < content_end {
+            x = canvas.put_str(x, y, w, &label, badge_style);
+            x = canvas.put_str(x, y, content_end.saturating_sub(x).min(1), " ", bg);
+        }
     }
 
     // Tabs, scrolling around the active tab when space is tight.
     let active = view.tabs.iter().position(|t| t.active).unwrap_or(0);
-    let available = canvas
-        .cols
-        .saturating_sub(x)
-        .saturating_sub(right_w.saturating_add(2));
+    let available = content_end.saturating_sub(x);
     if !view.tabs.is_empty() && available > 4 {
         let label = |tab: &WindowTab| -> String {
             let bell = if tab.bell { "● " } else { "" };
@@ -475,7 +503,7 @@ pub fn draw_status(canvas: &mut Canvas, theme: &Theme, view: &StatusView<'_>) ->
                 break;
             }
         }
-        if start > 0 && x + 2 < canvas.cols {
+        if start > 0 && x + 2 < content_end {
             x = canvas.put_str(
                 x,
                 y,
@@ -484,7 +512,7 @@ pub fn draw_status(canvas: &mut Canvas, theme: &Theme, view: &StatusView<'_>) ->
                 Style::default().fg(theme.muted).bg(theme.status_bg),
             );
         }
-        let tabs_end = canvas.cols.saturating_sub(right_w.saturating_add(1));
+        let tabs_end = content_end;
         for idx in start..end {
             let tab = &view.tabs[idx];
             let text = label(tab);
@@ -641,10 +669,14 @@ pub fn encode_frame(
                         body.extend_from_slice(b"\x1b]8;;\x1b\\");
                     }
                     if let Some(target) = &cell.link {
-                        body.extend_from_slice(b"\x1b]8;;");
-                        body.extend_from_slice(target.as_bytes());
-                        body.extend_from_slice(b"\x1b\\");
-                        link_open = true;
+                        if target.chars().any(char::is_control) {
+                            link_open = false;
+                        } else {
+                            body.extend_from_slice(b"\x1b]8;;");
+                            body.extend_from_slice(target.as_bytes());
+                            body.extend_from_slice(b"\x1b\\");
+                            link_open = true;
+                        }
                     } else {
                         link_open = false;
                     }
@@ -655,9 +687,12 @@ pub fn encode_frame(
                     cur_style = Some(cell.style);
                 }
                 let mut buf = [0u8; 4];
-                body.extend_from_slice(cell.ch.encode_utf8(&mut buf).as_bytes());
+                let ch = if cell.ch.is_control() { ' ' } else { cell.ch };
+                body.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
                 if let Some(extra) = &cell.extra {
-                    body.extend_from_slice(extra.as_bytes());
+                    for extra_ch in extra.chars().filter(|c| !c.is_control()) {
+                        body.extend_from_slice(extra_ch.encode_utf8(&mut buf).as_bytes());
+                    }
                 }
                 painted = true;
             }
@@ -693,6 +728,9 @@ pub fn encode_frame(
     }
 
     out.extend_from_slice(b"\x1b[?2026h");
+    // Close a hyperlink that a previous application (or a partially delivered
+    // frame) may have left open, so no cell inherits a stale URL.
+    out.extend_from_slice(b"\x1b]8;;\x1b\\");
     out.extend_from_slice(&body);
     out.extend_from_slice(b"\x1b[?2026l");
     out
@@ -860,6 +898,46 @@ mod tests {
         }
         assert_eq!(term.screen.active().cursor.row, 0);
         assert_eq!(term.screen.active().cursor.col, 0);
+    }
+
+    #[test]
+    fn text_input_cannot_inject_control_characters() {
+        let mut canvas = Canvas::new(20, 2);
+        canvas.put_str(0, 0, 20, "a\u{1b}]2;owned\u{7}b", Style::default());
+        let text: String = canvas
+            .row_text_for_test(0)
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
+        assert!(text.starts_with("a]2;ownedb"));
+    }
+
+    #[test]
+    fn frame_encoder_sanitizes_control_cells_and_links() {
+        let mut canvas = Canvas::new(20, 2);
+        let mut cell = Cell::ch('\u{1b}', Style::default());
+        cell.extra = Some("\u{009b}".into());
+        cell.link = Some(std::sync::Arc::from("https://example.com/\u{1b}]8;;evil"));
+        canvas.set(0, 0, cell);
+        let frame = encode_frame(None, None, &canvas, Caps::default());
+        let mut term = Terminal::new(20, 2, 100);
+        term.feed(&frame);
+        let got = term.screen.primary.get(0, 0);
+        assert_eq!(got.ch, ' ');
+        assert!(got.extra.is_none());
+        assert!(got.link.is_none());
+    }
+
+    #[test]
+    fn frame_closes_a_stale_hyperlink() {
+        let mut term = Terminal::new(20, 2, 100);
+        term.feed(b"\x1b]8;;https://stale.example\x1b\\old");
+        let mut canvas = Canvas::new(20, 2);
+        canvas.put_str(0, 1, 18, "plain", Style::default());
+        let frame = encode_frame(None, None, &canvas, Caps::default());
+        term.feed(&frame);
+        assert!(term.screen.primary.get(1, 0).link.is_none());
+        assert_eq!(term.screen.primary.get(1, 0).ch, 'p');
     }
 
     #[test]

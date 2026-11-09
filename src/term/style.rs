@@ -19,7 +19,7 @@ impl Color {
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.trim();
         if let Some(hex) = s.strip_prefix('#') {
-            if hex.len() == 6 {
+            if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
                 let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
                 let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
                 let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
@@ -173,5 +173,6 @@ mod tests {
         assert_eq!(Color::parse("red"), Some(Color::Indexed(1)));
         assert_eq!(Color::parse("200"), Some(Color::Indexed(200)));
         assert_eq!(Color::parse("nope"), None);
+        assert_eq!(Color::parse("#中中"), None); // six UTF-8 bytes, not six ASCII digits
     }
 }
