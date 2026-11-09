@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use nix::poll::{poll, PollFd, PollFlags};
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 
 use crate::config::Config;
 use crate::protocol::{Caps, ClientMsg, FrameReader, ServerMsg, PROTOCOL_VERSION};
@@ -37,7 +37,6 @@ pub fn attach(options: AttachOptions) -> Result<AttachOutcome> {
         .with_context(|| format!("connecting to session {:?}", options.name))?;
     stream.set_nonblocking(true)?;
 
-    let _flags = FdFlags::set_nonblocking(0)?;
     let winch = Arc::new(AtomicBool::new(false));
     let interrupted = Arc::new(AtomicBool::new(false));
     let _ = signal_hook::flag::register(signal_hook::consts::SIGWINCH, winch.clone());
@@ -63,7 +62,6 @@ pub fn attach(options: AttachOptions) -> Result<AttachOutcome> {
     let mut out_off = 0usize;
     let mut reader = FrameReader::new();
     let outcome: Option<AttachOutcome>;
-    let mut stdout = io::stdout();
     let mut socket_open = true;
     let connected_at = Instant::now();
     let mut welcomed = false;
@@ -201,14 +199,13 @@ pub fn attach(options: AttachOptions) -> Result<AttachOutcome> {
                                         welcomed = true;
                                     }
                                     ServerMsg::Frame(frame) | ServerMsg::Raw(frame) => {
-                                        if let Err(err) = stdout.write_all(&frame) {
+                                        if let Err(err) = write_terminal(&frame) {
                                             outcome = Some(AttachOutcome::Error(format!(
                                                 "cannot write to terminal: {}",
                                                 err
                                             )));
                                             break 'outer;
                                         }
-                                        let _ = stdout.flush();
                                     }
                                     ServerMsg::Info(_) => {}
                                     ServerMsg::Exit { reason, .. } => {
@@ -256,6 +253,61 @@ pub fn attach(options: AttachOptions) -> Result<AttachOutcome> {
     Ok(outcome.unwrap_or_else(|| AttachOutcome::Ended(format!("{} ended", options.name))))
 }
 
+/// Write a complete frame to the terminal.
+///
+/// The terminal may be non-blocking because a parent multiplexer or a previous
+/// tool set O_NONBLOCK on the shared terminal description. A large frame (for
+/// example when rtop redraws) can then fill the PTY buffer and return EAGAIN.
+/// Wait for writability instead of treating that as a fatal error, which used
+/// to make the client flash and exit.
+fn write_terminal(bytes: &[u8]) -> io::Result<()> {
+    write_all_fd(libc::STDOUT_FILENO, bytes)
+}
+
+fn write_all_fd(fd: libc::c_int, mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        let written =
+            unsafe { libc::write(fd, bytes.as_ptr() as *const libc::c_void, bytes.len()) };
+        if written > 0 {
+            bytes = &bytes[written as usize..];
+            continue;
+        }
+        if written == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "terminal write returned zero bytes",
+            ));
+        }
+        let err = io::Error::last_os_error();
+        match err.kind() {
+            io::ErrorKind::Interrupted => continue,
+            io::ErrorKind::WouldBlock => {
+                let mut poll_fd =
+                    PollFd::new(unsafe { BorrowedFd::borrow_raw(fd) }, PollFlags::POLLOUT);
+                loop {
+                    match poll(std::slice::from_mut(&mut poll_fd), PollTimeout::NONE) {
+                        Ok(_) => break,
+                        Err(nix::errno::Errno::EINTR) => continue,
+                        Err(err) => {
+                            return Err(io::Error::from_raw_os_error(err as i32));
+                        }
+                    }
+                }
+                let revents = poll_fd.revents().unwrap_or(PollFlags::empty());
+                if revents.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "terminal output is no longer writable",
+                    ));
+                }
+            }
+            _ => return Err(err),
+        }
+    }
+    Ok(())
+}
+
 fn queue_msg<T: crate::protocol::WireMessage>(out: &mut Vec<u8>, msg: &T) -> Result<()> {
     const MAX_QUEUE: usize = 16 * 1024 * 1024;
     let bytes = crate::protocol::encode(msg)
@@ -281,17 +333,13 @@ fn write_some(stream: &mut UnixStream, out: &mut [u8], off: &mut usize) -> io::R
 }
 
 fn read_fd(fd: libc::c_int, buf: &mut [u8]) -> io::Result<usize> {
-    loop {
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if n >= 0 {
-            return Ok(n as usize);
-        }
-        let err = io::Error::last_os_error();
-        match err.raw_os_error() {
-            Some(libc::EINTR) => continue,
-            _ => return Err(err),
-        }
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+    if n >= 0 {
+        return Ok(n as usize);
     }
+    // Return EINTR to the event loop instead of retrying here. signal-hook
+    // only sets flags; the loop must get a chance to process SIGTERM/winch.
+    Err(io::Error::last_os_error())
 }
 
 fn terminal_size() -> (u16, u16) {
@@ -337,36 +385,6 @@ fn detect_truecolor() -> bool {
     false
 }
 
-struct FdFlags {
-    fd: libc::c_int,
-    flags: libc::c_int,
-}
-
-impl FdFlags {
-    fn set_nonblocking(fd: libc::c_int) -> io::Result<Self> {
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFL);
-            if flags < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if flags & libc::O_NONBLOCK == 0
-                && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(Self { fd, flags })
-        }
-    }
-}
-
-impl Drop for FdFlags {
-    fn drop(&mut self) {
-        unsafe {
-            libc::fcntl(self.fd, libc::F_SETFL, self.flags);
-        }
-    }
-}
-
 struct TerminalGuard {
     original: libc::termios,
     active: bool,
@@ -405,11 +423,10 @@ impl TerminalGuard {
                 seq.push_str("\x1b[?1003h\x1b[?1006h");
             }
             seq.push_str(&format!("\x1b]2;rscreen: {}\x1b\\", title));
-            if let Err(err) = io::stdout().write_all(seq.as_bytes()) {
+            if let Err(err) = write_terminal(seq.as_bytes()) {
                 guard.restore_now();
                 return Err(err).context("initializing terminal");
             }
-            let _ = io::stdout().flush();
             guard.active = true;
             Ok(guard)
         }
@@ -431,9 +448,7 @@ impl TerminalGuard {
         seq.push_str("\x1b[?25h");
         seq.push_str("\x1b[?1049l");
         seq.push_str("\x1b[23;0t");
-        let mut out = io::stdout();
-        let _ = out.write_all(seq.as_bytes());
-        let _ = out.flush();
+        let _ = write_terminal(seq.as_bytes());
         unsafe {
             libc::tcsetattr(0, libc::TCSANOW, &self.original);
         }
@@ -448,4 +463,68 @@ impl Drop for TerminalGuard {
 
 fn sanitize_title(name: &str) -> String {
     name.chars().filter(|c| !c.is_control()).take(80).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::File;
+    use std::io::{Seek as _, SeekFrom};
+    use std::os::fd::AsRawFd;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn write_all_fd_writes_every_byte() {
+        let mut file = tempfile::tempfile().expect("temporary file");
+        let payload = b"terminal frame".repeat(4096);
+        write_all_fd(file.as_raw_fd(), &payload).expect("write frame");
+        file.seek(SeekFrom::Start(0)).expect("rewind");
+        let mut read = Vec::new();
+        file.read_to_end(&mut read).expect("read back");
+        assert_eq!(read, payload);
+    }
+
+    #[test]
+    fn write_all_fd_waits_for_a_full_nonblocking_pipe() {
+        let (read_fd, write_fd) = nix::unistd::pipe().expect("pipe");
+        let write_file = File::from(write_fd);
+        let mut read_file = File::from(read_fd);
+        let fd = write_file.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert!(unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0);
+
+        let filler = [b'x'; 4096];
+        let mut filled = 0usize;
+        loop {
+            let written =
+                unsafe { libc::write(fd, filler.as_ptr().cast::<libc::c_void>(), filler.len()) };
+            if written > 0 {
+                filled += written as usize;
+                continue;
+            }
+            match io::Error::last_os_error().kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => break,
+                other => panic!("unexpected pipe write error: {other:?}"),
+            }
+        }
+        assert!(filled > 0, "pipe did not fill");
+
+        let reader = thread::spawn(move || {
+            let mut data = Vec::new();
+            read_file.read_to_end(&mut data).expect("drain pipe");
+            data
+        });
+        // Give the reader a chance to block on the pipe, then write through
+        // the same non-blocking descriptor. The helper must poll and retry
+        // rather than surfacing EAGAIN.
+        thread::sleep(Duration::from_millis(10));
+        write_all_fd(fd, b"payload").expect("write after drain");
+        drop(write_file);
+        let data = reader.join().expect("reader thread");
+        assert_eq!(data.len(), filled + b"payload".len());
+        assert!(data.ends_with(b"payload"));
+    }
 }

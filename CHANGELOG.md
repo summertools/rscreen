@@ -4,6 +4,21 @@ All notable changes to rscreen are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and rscreen uses
 [Semantic Versioning](https://semver.org/).
 
+## [0.1.2] - 2026-11-09
+
+### Fixed
+
+- Fixed the client exiting with `cannot write to terminal: Resource
+  temporarily unavailable (os error 11)` when attached to a large terminal or
+  when a full-screen program such as rtop produced a large frame. The client
+  no longer makes stdin non-blocking on the shared terminal description, and
+  terminal writes now wait for writability and retry instead of treating
+  `EAGAIN` as fatal.
+- Input reads return `EINTR` to the event loop so SIGTERM and resize signals
+  are processed promptly even while waiting for keyboard input.
+
+[0.1.2]: https://github.com/summertools/rscreen/releases/tag/v0.1.2
+
 ## [0.1.1] - 2026-11-09
 
 Security, robustness and UI follow-up. **The local protocol changed to a
